@@ -1,0 +1,214 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>GrayShare</title>
+  <link rel="icon" type="image/x-icon" href="/static/app_icon.ico" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link
+    href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,600;0,700;1,600&family=Inter:wght@400;500;600&display=swap"
+    rel="stylesheet" />
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+
+<body>
+  <div class="app">
+    <header class="app-header">
+      <h1 class="app-title">GrayShare</h1>
+      <button type="button" id="theme-toggle" class="theme-toggle">Dark</button>
+    </header>
+
+    <!-- Transfer: main send/receive experience -->
+    <main id="view-transfer" class="view view--transfer">
+      <div class="hero-actions">
+        <button type="button" id="mode-share" class="btn-pill btn-pill--send" aria-pressed="false">
+          <span class="btn-pill__label">Send</span>
+          <span class="btn-pill__icon" aria-hidden="true">
+            <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+              stroke-linecap="round">
+              <path d="M7 17L17 7M17 7H9M17 7V15" />
+            </svg>
+          </span>
+        </button>
+        <button type="button" id="mode-idle" class="btn-pill btn-pill--receive active" aria-pressed="true">
+          <span class="btn-pill__label">Receive</span>
+          <span class="btn-pill__icon" aria-hidden="true">
+            <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+              stroke-linecap="round">
+              <path d="M17 7L7 17M7 17H15M7 17V9" />
+            </svg>
+          </span>
+        </button>
+      </div>
+      <div class="network-row">
+        <div id="server-endpoint" class="network-pill">URL: detecting...</div>
+        <button type="button" id="show-qr" class="btn-qr">Show QR</button>
+      </div>
+      <div id="qr-wrap" class="qr-wrap hidden">
+        <div id="qr-code" class="qr-code"></div>
+        <p id="qr-text" class="qr-text"></p>
+      </div>
+
+      <section id="share-panel" class="sheet hidden">
+        <h2 class="sheet__title">Send a file</h2>
+        <p class="sheet__hint">You won’t receive until you stop sharing.</p>
+        <form id="share-form" class="form">
+          <div class="form__field">
+            <label class="form__label" for="share-file">File</label>
+            <div class="form__file-shell">
+              <div class="form__file-visual">
+                <span class="form__file-btn">Choose file</span>
+                <span class="form__file-name" id="share-file-label">No file selected</span>
+              </div>
+              <input id="share-file" class="form__file-input" type="file" name="file" required />
+            </div>
+          </div>
+
+          <div class="form__field">
+            <label class="form__label" for="passcode">
+              Passcode <span class="form__optional">(optional)</span>
+            </label>
+            <div class="form__input-shell">
+              <span class="form__input-icon" aria-hidden="true">
+                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75"
+                  stroke-linecap="round" stroke-linejoin="round">
+                  <rect x="5" y="11" width="14" height="10" rx="2" />
+                  <path d="M8 11V8a4 4 0 018 0v3" />
+                </svg>
+              </span>
+              <input type="password" id="passcode" name="passcode" maxlength="64" class="form__input"
+                placeholder="Leave blank for open access" autocomplete="new-password" />
+            </div>
+            <p class="form__hint">Receivers will need this code to download your file.</p>
+          </div>
+          <button id="share-submit" type="submit" class="btn-primary">Start sending</button>
+        </form>
+        <div id="upload-progress-wrap" class="upload-progress-wrap hidden" aria-live="polite">
+          <div class="progress-bar" id="upload-progress-bar">
+            <div class="progress-fill" id="upload-progress-fill"></div>
+          </div>
+          <div id="upload-progress-text" class="upload-progress-text"></div>
+        </div>
+        <div id="share-status" class="status"></div>
+        <button id="stop-share" type="button" class="btn-stop hidden">Stop sending</button>
+      </section>
+
+      <section id="receive-panel" class="sheet sheet--receive">
+        <h2 class="sheet__title">Available to receive</h2>
+        <p class="sheet__hint">Tap <strong>Receive</strong> on a sender to download.</p>
+        <ul id="shares-list" class="shares-list"></ul>
+      </section>
+    </main>
+
+    <section id="view-history" class="view view--secondary hidden" aria-labelledby="history-heading">
+      <h2 class="page-title" id="history-heading">History</h2>
+      <p class="page-desc">Send, receive, and stop events on this server. History clears when the process restarts.</p>
+      <button type="button" id="activity-refresh" class="btn-toolbar">Refresh</button>
+      <div id="activity-empty" class="empty-state hidden">No activity yet — share or receive a file on Transfer.</div>
+      <ul id="activity-list" class="activity-list"></ul>
+    </section>
+
+    <section id="view-settings" class="view view--secondary hidden" aria-labelledby="settings-heading">
+      <h2 class="page-title" id="settings-heading">Settings</h2>
+      <div class="settings-block">
+        <label class="form__label" for="setting-display-name">Display name</label>
+        <div class="form__input-shell">
+          <span class="form__input-icon" aria-hidden="true">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75"
+              stroke-linecap="round">
+              <circle cx="12" cy="8" r="3.5" />
+              <path d="M5 20v-1.2C5 15.3 8.1 13 12 13s7 2.3 7 5.8V20" />
+            </svg>
+          </span>
+          <input type="text" id="setting-display-name" class="form__input" maxlength="40"
+            placeholder="e.g. Studio laptop" autocomplete="nickname" />
+        </div>
+        <p class="form__hint">Shown to others when you share a file.</p>
+      </div>
+
+      <div class="settings-block">
+        <label class="form__label" for="setting-chunk-mb">Chunk size</label>
+        <div class="form__input-shell form__input-shell--narrow">
+          <input type="number" id="setting-chunk-mb" class="form__input" min="1" max="256" step="1" value="0" />
+          <span class="form__suffix" aria-hidden="true">MB</span>
+        </div>
+        <p class="form__hint">0 = auto (match upload speed). Manual override rarely needed.</p>
+      </div>
+
+      <div class="settings-block">
+        <label class="form__label" for="setting-threads">Threads</label>
+        <div class="form__input-shell form__input-shell--narrow">
+          <input type="number" id="setting-threads" class="form__input" min="1" max="16" step="1" value="0" />
+        </div>
+        <p class="form__hint">0 = auto (based on RAM). Reduce if the browser is slow.</p>
+      </div>
+
+      <div class="settings-block">
+        <label class="form__label" for="setting-refresh">Transfer list refresh</label>
+        <div class="form__input-shell form__input-shell--narrow">
+          <input type="number" id="setting-refresh" class="form__input" min="2" max="60" step="1" value="3" />
+          <span class="form__suffix" aria-hidden="true">sec</span>
+        </div>
+        <p class="form__hint">How often the Receive list checks for active senders (2–60 seconds).</p>
+      </div>
+      <div class="settings-block">
+        <button type="button" id="clear-data" class="btn-stop">Clear Data</button>
+        <p class="form__hint">Deletes stored files and app data under <code>%USERPROFILE%\.grayshare</code> but keeps your saved settings.</p>
+      </div>
+    </section>
+
+    <nav class="bottom-nav" aria-label="Main">
+      <button type="button" class="nav-item nav-item--active" data-view="transfer" id="nav-transfer">
+        <span class="nav-item__icon" aria-hidden="true">
+          <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75"
+            stroke-linecap="round" stroke-linejoin="round">
+            <path d="M4 12H2M2 12l3-3M2 12l3 3" />
+            <path d="M20 12h2M22 12l-3-3M22 12l-3 3" />
+            <path d="M9 12h6" />
+          </svg>
+        </span>
+        <span class="nav-item__label">Transfer</span>
+      </button>
+      <button type="button" class="nav-item" data-view="history" id="nav-history">
+        <span class="nav-item__icon" aria-hidden="true">
+          <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75">
+            <circle cx="12" cy="12" r="9" />
+            <path d="M12 7v5l3 2" />
+          </svg>
+        </span>
+        <span class="nav-item__label">History</span>
+      </button>
+      <button type="button" class="nav-item" data-view="settings" id="nav-settings">
+        <span class="nav-item__icon" aria-hidden="true">
+          <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75">
+            <circle cx="12" cy="12" r="3" />
+            <path
+              d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41" />
+          </svg>
+        </span>
+        <span class="nav-item__label">Settings</span>
+      </button>
+    </nav>
+  </div>
+
+  <div id="receive-overlay" class="receive-overlay hidden" aria-hidden="true" role="dialog"
+    aria-labelledby="receive-overlay-title">
+    <div class="receive-card">
+      <h3 id="receive-overlay-title">Downloading</h3>
+      <p id="receive-overlay-file" class="receive-overlay-sub"></p>
+      <div class="progress-bar" id="receive-progress-bar">
+        <div class="progress-fill" id="receive-progress-fill"></div>
+      </div>
+      <p id="receive-overlay-status" class="receive-overlay-status"></p>
+    </div>
+  </div>
+  <div id="toast-root" class="toast-root" aria-live="polite" aria-atomic="false"></div>
+
+  <script src="/static/qrcode.min.js"></script>
+  <script src="/static/app.js"></script>
+</body>
+
+</html>
