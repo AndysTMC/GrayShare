@@ -38,20 +38,46 @@ Key subpaths:
 - `inbox`
 - `webview`
 - `startup.log`
+- `settings.json`
+- `app_config.json`
 
 ### Client Settings
 
-Client settings are intentionally stored in web `localStorage`, not in a backend config file.
+Client settings are split by access path:
 
-Do not reintroduce a server-side settings JSON unless that is an explicit product change.
+- loopback / desktop (`localhost`, `127.0.0.1`, `::1`)
+  Uses `%USERPROFILE%\.grayshare\settings.json`
+- LAN / browser clients
+  Use browser `localStorage`
+
+Do not collapse this back to a single storage path unless that is an explicit product change.
+
+### Desktop Port Config
+
+The preferred desktop port is stored in:
+
+- `%USERPROFILE%\.grayshare\app_config.json`
+
+Loopback Settings can:
+
+- validate a candidate port with `/api/app/port-check`
+- save the chosen port and trigger a desktop restart with `/api/app/restart`
+
+If the configured port is unavailable at startup, `desktop_app.py` falls back to an automatic port and logs the failure in `startup.log`.
 
 ### Clear Data
 
-`POST /api/data/clear` is supposed to remove runtime data while preserving the webview/browser profile so `localStorage` settings survive.
+`POST /api/data/clear` is supposed to remove runtime data while preserving:
+
+- `%USERPROFILE%\.grayshare\settings.json`
+- `%USERPROFILE%\.grayshare\app_config.json`
+- `%USERPROFILE%\.grayshare\webview`
 
 If you change clear-data behavior, check the interaction with:
 
 - `%USERPROFILE%\.grayshare\webview`
+- `%USERPROFILE%\.grayshare\settings.json`
+- `%USERPROFILE%\.grayshare\app_config.json`
 - `desktop_app.py` startup cleanup
 - the Settings page copy in `templates/index.html`
 - the success message in `static/app.js`

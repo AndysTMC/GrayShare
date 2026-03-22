@@ -12,9 +12,10 @@ from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Optional, Set, Tuple
 
 from fastapi import (
+    BackgroundTasks,
     FastAPI,
     File,
     Form,
@@ -49,6 +50,7 @@ APP_DATA_DIR.mkdir(parents=True, exist_ok=True)
 INBOX_DIR = APP_DATA_DIR / "inbox"
 INBOX_DIR.mkdir(exist_ok=True)
 SETTINGS_FILE = APP_DATA_DIR / "settings.json"
+APP_CONFIG_FILE = APP_DATA_DIR / "app_config.json"
 WEBVIEW_DATA_DIR = APP_DATA_DIR / "webview"
 
 # Large file I/O: avoid tiny default buffer; stream instead of loading whole file into RAM.
@@ -68,6 +70,11 @@ DEFAULT_CLIENT_SETTINGS = {
     "refresh_sec": 3,
     "theme": "light",
 }
+DEFAULT_APP_CONFIG = {
+    "port": 0,
+}
+runtime_current_port = int(os.getenv("APP_PORT", "0") or "0")
+runtime_restart_callback: Optional[Callable[[int], None]] = None
 
 
 def log_activity(kind: str, message: str, meta: Optional[Dict[str, Any]] = None) -> None:
@@ -90,6 +97,19 @@ def _normalize_client_settings(raw: Dict[str, Any] | None = None) -> ClientSetti
     theme = str(data.get("theme", "light")).lower().strip()
     data["theme"] = "dark" if theme == "dark" else "light"
     return ClientSettings.model_validate(data)
+
+
+def _normalize_app_config(raw: Dict[str, Any] | None = None) -> AppConfig:
+    data = dict(DEFAULT_APP_CONFIG)
+    if raw:
+        data.update(raw)
+    try:
+        data["port"] = int(data.get("port", 0))
+    except Exception:
+        data["port"] = 0
+    if data["port"] < 0 or data["port"] > 65535:
+        data["port"] = 0
+    return AppConfig.model_validate(data)
 
 
 def _load_client_settings_sync() -> ClientSettings:
@@ -117,6 +137,58 @@ def _save_client_settings_sync(settings: ClientSettings) -> ClientSettings:
     return normalized
 
 
+def _load_app_config_sync() -> AppConfig:
+    if APP_CONFIG_FILE.is_file():
+        try:
+            raw = json.loads(APP_CONFIG_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            raw = DEFAULT_APP_CONFIG
+    else:
+        raw = DEFAULT_APP_CONFIG
+    config = _normalize_app_config(raw)
+    APP_CONFIG_FILE.write_text(
+        json.dumps(config.model_dump(), indent=2),
+        encoding="utf-8",
+    )
+    return config
+
+
+def _save_app_config_sync(config: AppConfig) -> AppConfig:
+    normalized = _normalize_app_config(config.model_dump())
+    APP_CONFIG_FILE.write_text(
+        json.dumps(normalized.model_dump(), indent=2),
+        encoding="utf-8",
+    )
+    return normalized
+
+
+def _check_port_availability_sync(port: int, current_port: int) -> tuple[bool, str]:
+    if port < 1 or port > 65535:
+        return False, "Enter a port between 1 and 65535."
+    if current_port > 0 and port == current_port:
+        return True, f"Port {port} is the current GrayShare port."
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        try:
+            if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+            sock.bind(("0.0.0.0", port))
+        except OSError:
+            return False, f"Port {port} is not available."
+    return True, f"Port {port} is available. Restart to apply it."
+
+
+def configure_runtime_control(
+    *,
+    current_port: int,
+    restart_callback: Optional[Callable[[int], None]] = None,
+) -> None:
+    global runtime_current_port
+    global runtime_restart_callback
+    runtime_current_port = max(0, int(current_port or 0))
+    runtime_restart_callback = restart_callback
+
+
 def _clear_app_data_sync() -> tuple[int, int, List[str]]:
     deleted_items = 0
     preserved_items = 0
@@ -124,6 +196,8 @@ def _clear_app_data_sync() -> tuple[int, int, List[str]]:
     preserve = set()
     if SETTINGS_FILE.exists():
         preserve.add(SETTINGS_FILE.resolve())
+    if APP_CONFIG_FILE.exists():
+        preserve.add(APP_CONFIG_FILE.resolve())
     if WEBVIEW_DATA_DIR.exists():
         preserve.add(WEBVIEW_DATA_DIR.resolve())
 
@@ -173,6 +247,33 @@ class ServerSettings(BaseModel):
     inbox_path: str
     app_data_path: str
     smb_active: bool
+
+
+class AppConfig(BaseModel):
+    port: int = Field(default=0, ge=0, le=65535)
+
+
+class DesktopConfigState(BaseModel):
+    configured_port: int = Field(default=0, ge=0, le=65535)
+    current_port: int = Field(default=0, ge=0, le=65535)
+    restart_supported: bool
+
+
+class PortAvailability(BaseModel):
+    port: int = Field(ge=1, le=65535)
+    available: bool
+    message: str
+    current_port: int = Field(default=0, ge=0, le=65535)
+
+
+class RestartRequest(BaseModel):
+    port: int = Field(ge=1, le=65535)
+
+
+class RestartResult(BaseModel):
+    status: str
+    port: int = Field(ge=1, le=65535)
+    message: str
 
 
 class ShareInitBody(BaseModel):
@@ -693,6 +794,61 @@ async def update_client_settings(settings: ClientSettings):
     return await asyncio.to_thread(_save_client_settings_sync, settings)
 
 
+@app.get("/api/app/config", response_model=DesktopConfigState)
+async def get_desktop_config(request: Request):
+    if not _is_loopback_request(request):
+        raise HTTPException(status_code=403, detail="Desktop settings are only available locally.")
+    config = await asyncio.to_thread(_load_app_config_sync)
+    return DesktopConfigState(
+        configured_port=config.port,
+        current_port=runtime_current_port,
+        restart_supported=runtime_restart_callback is not None,
+    )
+
+
+@app.get("/api/app/port-check", response_model=PortAvailability)
+async def check_desktop_port(request: Request, port: int = Query(..., ge=1, le=65535)):
+    if not _is_loopback_request(request):
+        raise HTTPException(status_code=403, detail="Desktop settings are only available locally.")
+    available, message = await asyncio.to_thread(
+        _check_port_availability_sync,
+        port,
+        runtime_current_port,
+    )
+    return PortAvailability(
+        port=port,
+        available=available,
+        message=message,
+        current_port=runtime_current_port,
+    )
+
+
+@app.post("/api/app/restart", response_model=RestartResult)
+async def restart_desktop_app(
+    payload: RestartRequest,
+    request: Request,
+    background_tasks: BackgroundTasks,
+):
+    if not _is_loopback_request(request):
+        raise HTTPException(status_code=403, detail="Desktop restart is only available locally.")
+    if runtime_restart_callback is None:
+        raise HTTPException(status_code=501, detail="Restart is not available in browser-only mode.")
+    available, message = await asyncio.to_thread(
+        _check_port_availability_sync,
+        payload.port,
+        runtime_current_port,
+    )
+    if not available:
+        raise HTTPException(status_code=409, detail=message)
+    await asyncio.to_thread(_save_app_config_sync, AppConfig(port=payload.port))
+    background_tasks.add_task(runtime_restart_callback, payload.port)
+    return RestartResult(
+        status="restarting",
+        port=payload.port,
+        message=f"Restarting GrayShare on port {payload.port}.",
+    )
+
+
 @app.post("/api/data/clear", response_model=DataClearResult)
 async def clear_app_data():
     for session in list(share_sessions.values()):
@@ -707,6 +863,8 @@ async def clear_app_data():
     deleted_items, preserved_items, skipped = await asyncio.to_thread(_clear_app_data_sync)
     if SETTINGS_FILE.exists():
         skipped.append("settings.json preserved")
+    if APP_CONFIG_FILE.exists():
+        skipped.append("app_config.json preserved")
     if WEBVIEW_DATA_DIR.exists():
         skipped.append("webview profile preserved so local settings remain available")
     return DataClearResult(

@@ -325,13 +325,18 @@ const viewTransfer = document.getElementById("view-transfer");
 const viewHistory = document.getElementById("view-history");
 const viewSettings = document.getElementById("view-settings");
 const navHistory = document.getElementById("nav-history");
+const portSettingsBlock = document.getElementById("server-port-block");
 const settingRefreshBlock = document.getElementById("setting-refresh")?.closest(".settings-block");
 const clearDataBlock = document.getElementById("clear-data")?.closest(".settings-block");
+const settingPortInput = document.getElementById("setting-port");
+const settingPortStatus = document.getElementById("setting-port-status");
+const restartAppBtn = document.getElementById("restart-app");
 
 function applyClientVisibility() {
   if (isLoopbackOrigin()) return;
   if (viewHistory) viewHistory.classList.add("hidden");
   if (navHistory) navHistory.classList.add("hidden");
+  if (portSettingsBlock) portSettingsBlock.classList.add("hidden");
   if (settingRefreshBlock) settingRefreshBlock.classList.add("hidden");
   if (clearDataBlock) clearDataBlock.classList.add("hidden");
 }
@@ -368,6 +373,13 @@ const DEFAULT_CLIENT_SETTINGS = {
 };
 const CLIENT_SETTINGS_STORAGE_KEY = "grayshare.clientSettings";
 let clientSettings = { ...DEFAULT_CLIENT_SETTINGS };
+let desktopConfig = {
+  configured_port: 0,
+  current_port: 0,
+  restart_supported: false,
+};
+let portCheckTimerId = null;
+let portCheckRequestId = 0;
 
 function clampInt(value, min, max, fallback) {
   const n = parseInt(value, 10);
@@ -600,6 +612,9 @@ async function loadSettingsPanel() {
   if (chunkInput) chunkInput.value = String(getChunkMb());
   if (threadsInput) threadsInput.value = String(getThreads());
   if (refreshInput) refreshInput.value = String(getRefreshSec());
+  if (isLoopbackOrigin()) {
+    await loadDesktopConfig();
+  }
 }
 
 const activityRefreshBtn = document.getElementById("activity-refresh");
@@ -656,6 +671,143 @@ if (settingThreads) {
       await saveClientSettings();
     } catch (err) {
       showToast(parseErrorDetail(err), "error");
+    }
+  });
+}
+
+function parsePortInput(value) {
+  const text = String(value ?? "").trim();
+  if (!text) {
+    return { valid: false, port: 0, message: "Enter a port between 1 and 65535." };
+  }
+  const port = parseInt(text, 10);
+  if (Number.isNaN(port) || port < 1 || port > 65535) {
+    return { valid: false, port: 0, message: "Enter a port between 1 and 65535." };
+  }
+  return { valid: true, port, message: "" };
+}
+
+function setPortStatus(message) {
+  if (settingPortStatus) {
+    settingPortStatus.textContent = message;
+  }
+}
+
+function setRestartButtonEnabled(enabled) {
+  if (restartAppBtn) {
+    restartAppBtn.disabled = !enabled;
+  }
+}
+
+async function loadDesktopConfig() {
+  if (!isLoopbackOrigin() || !settingPortInput) return;
+  try {
+    const res = await fetchWithTimeout("/api/app/config", { method: "GET" }, HEALTH_PING_TIMEOUT_MS);
+    if (!res.ok) {
+      throw await parseResponseError(res, "Unable to load desktop settings.");
+    }
+    desktopConfig = await res.json();
+    const preferredPort = desktopConfig.configured_port || desktopConfig.current_port || 0;
+    settingPortInput.value = preferredPort > 0 ? String(preferredPort) : "";
+    if (!desktopConfig.restart_supported) {
+      setPortStatus("Restart is only available from the GrayShare desktop app.");
+      setRestartButtonEnabled(false);
+      return;
+    }
+    if (preferredPort > 0) {
+      await checkPortAvailability(preferredPort);
+      return;
+    }
+    setPortStatus("Enter a port between 1 and 65535.");
+    setRestartButtonEnabled(false);
+  } catch (err) {
+    setPortStatus(parseErrorDetail(err));
+    setRestartButtonEnabled(false);
+  }
+}
+
+async function checkPortAvailability(port) {
+  if (!isLoopbackOrigin()) return;
+  const requestId = ++portCheckRequestId;
+  setPortStatus(`Checking port ${port}...`);
+  setRestartButtonEnabled(false);
+  try {
+    const res = await fetchWithTimeout(
+      `/api/app/port-check?port=${encodeURIComponent(port)}`,
+      { method: "GET" },
+      HEALTH_PING_TIMEOUT_MS,
+    );
+    if (!res.ok) {
+      throw await parseResponseError(res, "Unable to check port.");
+    }
+    if (requestId !== portCheckRequestId) {
+      return;
+    }
+    const result = await res.json();
+    setPortStatus(result.message || `Port ${port} checked.`);
+    setRestartButtonEnabled(Boolean(result.available && desktopConfig.restart_supported));
+  } catch (err) {
+    if (requestId !== portCheckRequestId) {
+      return;
+    }
+    setPortStatus(parseErrorDetail(err));
+    setRestartButtonEnabled(false);
+  }
+}
+
+function schedulePortAvailabilityCheck() {
+  if (!settingPortInput) return;
+  if (portCheckTimerId) clearTimeout(portCheckTimerId);
+  const parsed = parsePortInput(settingPortInput.value);
+  if (!parsed.valid) {
+    portCheckRequestId += 1;
+    setPortStatus(parsed.message);
+    setRestartButtonEnabled(false);
+    return;
+  }
+  portCheckTimerId = setTimeout(() => {
+    checkPortAvailability(parsed.port);
+  }, 250);
+}
+
+if (settingPortInput) {
+  settingPortInput.addEventListener("input", schedulePortAvailabilityCheck);
+  settingPortInput.addEventListener("change", schedulePortAvailabilityCheck);
+}
+
+if (restartAppBtn) {
+  restartAppBtn.addEventListener("click", async () => {
+    const parsed = parsePortInput(settingPortInput?.value || "");
+    if (!parsed.valid) {
+      setPortStatus(parsed.message);
+      setRestartButtonEnabled(false);
+      return;
+    }
+
+    const prevText = restartAppBtn.textContent;
+    restartAppBtn.disabled = true;
+    restartAppBtn.textContent = "Restarting...";
+    try {
+      const res = await fetch("/api/app/restart", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ port: parsed.port }),
+      });
+      if (!res.ok) {
+        throw await parseResponseError(res, "Unable to restart GrayShare.");
+      }
+      const result = await res.json();
+      setPortStatus(result.message);
+      showToast(result.message, "success");
+      if (!window.pywebview) {
+        window.setTimeout(() => {
+          window.location.href = `${window.location.protocol}//${window.location.hostname}:${parsed.port}/`;
+        }, 2500);
+      }
+    } catch (err) {
+      restartAppBtn.textContent = prevText;
+      showToast(parseErrorDetail(err), "error");
+      schedulePortAvailabilityCheck();
     }
   });
 }

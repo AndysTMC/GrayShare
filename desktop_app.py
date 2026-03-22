@@ -1,10 +1,13 @@
 import argparse
 import atexit
 import ipaddress
+import json
 import os
 import shutil
 import socket
 import ssl
+import subprocess
+import sys
 import traceback
 import tempfile
 import threading
@@ -329,6 +332,123 @@ def app_data_dir() -> Path:
     return path
 
 
+def _normalize_app_config(raw: dict | None = None) -> dict:
+    port = 0
+    if raw:
+        try:
+            port = int(raw.get("port", 0))
+        except Exception:
+            port = 0
+    if port < 0 or port > 65535:
+        port = 0
+    return {"port": port}
+
+
+def load_app_config(data_dir: Path) -> dict:
+    config_path = data_dir / "app_config.json"
+    if not config_path.is_file():
+        return _normalize_app_config()
+    try:
+        raw = json.loads(config_path.read_text(encoding="utf-8"))
+    except Exception:
+        raw = {}
+    config = _normalize_app_config(raw)
+    config_path.write_text(json.dumps(config, indent=2), encoding="utf-8")
+    return config
+
+
+class DesktopController:
+    def __init__(self, args, log_file: Path):
+        self.args = args
+        self.log_file = log_file
+        self.window = None
+        self._restarting = False
+
+    def bind_window(self, window) -> None:
+        self.window = window
+
+    def request_restart(self, port: int) -> None:
+        if self._restarting:
+            return
+        self._restarting = True
+        append_startup_log(self.log_file, f"Restart requested for port {port}.")
+        threading.Thread(
+            target=self._restart_worker,
+            args=(port,),
+            daemon=True,
+            name="GrayShareRestart",
+        ).start()
+
+    def _restart_worker(self, port: int) -> None:
+        try:
+            command = self._build_restart_command(port)
+            self._launch_detached(command)
+            append_startup_log(
+                self.log_file,
+                f"Queued GrayShare restart on port {port}.",
+            )
+            time.sleep(0.4)
+            os._exit(0)
+        except Exception:
+            self._restarting = False
+            append_startup_log(
+                self.log_file,
+                "Restart request failed:\n"
+                f"{traceback.format_exc().rstrip()}",
+            )
+
+    def _build_restart_command(self, port: int) -> list[str]:
+        if getattr(sys, "frozen", False):
+            command = [sys.executable]
+        else:
+            command = [sys.executable, str(Path(__file__).resolve())]
+        command.extend(
+            [
+                "--port",
+                str(port),
+                "--width",
+                str(self.args.width),
+                "--height",
+                str(self.args.height),
+                "--title",
+                self.args.title,
+            ]
+        )
+        if self.args.tls and not self.args.no_tls:
+            command.append("--tls")
+        if self.args.no_tls:
+            command.append("--no-tls")
+        return command
+
+    def _launch_detached(self, command: list[str]) -> None:
+        def _ps_quote(value: str) -> str:
+            return "'" + value.replace("'", "''") + "'"
+
+        quoted_args = ", ".join(_ps_quote(arg) for arg in command[1:])
+        script = (
+            f"Start-Sleep -Seconds 1; Start-Process -FilePath {_ps_quote(command[0])}"
+        )
+        if quoted_args:
+            script += f" -ArgumentList @({quoted_args})"
+        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        subprocess.Popen(
+            [
+                "powershell",
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-WindowStyle",
+                "Hidden",
+                "-Command",
+                script,
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=creationflags,
+        )
+
+
 def purge_deferred_data(data_dir: Path) -> None:
     marker = data_dir / ".clear_webview"
     if not marker.exists():
@@ -343,18 +463,21 @@ def main():
 
     host_ip = detect_local_ip()
     data_dir = app_data_dir()
+    app_config = load_app_config(data_dir)
+    configured_port = app_config.get("port", 0)
     purge_deferred_data(data_dir)
     os.environ["APP_DATA_DIR"] = str(data_dir)
     os.environ["APP_HOST_IP"] = host_ip
     log_file = data_dir / "startup.log"
     append_startup_log(log_file, "Launching GrayShare desktop app.")
+    controller = DesktopController(args, log_file)
     temp_dir = Path(tempfile.mkdtemp(prefix="grayshare_"))
     bind_host = "0.0.0.0"
     cert_file = None
     key_file = None
     server = None
     ui_url = ""
-    port = args.port if args.port > 0 else 0
+    port = args.port if args.port > 0 else configured_port
     mdns = None
     upnp = None
 
@@ -434,6 +557,11 @@ def main():
         server = None
         cert_file = None
         key_file = None
+        if args.port <= 0 and configured_port > 0 and port == configured_port:
+            append_startup_log(
+                log_file,
+                f"Configured port {configured_port} is unavailable. Falling back to an automatic port.",
+            )
         port = 0
     if not ok:
         cleanup()
@@ -443,6 +571,20 @@ def main():
         )
 
     append_startup_log(log_file, f"Embedded server is healthy at {ui_url}.")
+    try:
+        import main as server_main
+
+        if hasattr(server_main, "configure_runtime_control"):
+            server_main.configure_runtime_control(
+                current_port=port,
+                restart_callback=controller.request_restart,
+            )
+    except Exception:
+        append_startup_log(
+            log_file,
+            "Unable to attach runtime control hooks:\n"
+            f"{traceback.format_exc().rstrip()}",
+        )
     mdns = MdnsAnnouncer(host_ip, port)
     upnp = PortForwarder(port)
     mdns.start()
@@ -459,6 +601,7 @@ def main():
             js_api=bridge,
         )
         bridge.bind_window(window)
+        controller.bind_window(window)
         webview.start(
             debug=False,
             private_mode=False,

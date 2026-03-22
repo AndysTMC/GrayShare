@@ -72,15 +72,30 @@ If `FILES_STORAGE_MODE` is not set, GrayShare uses local storage.
 
 ### Client Settings
 
-Client-side settings are stored in browser/webview `localStorage`, not in a backend config file.
+Client settings are split by how the app is opened:
 
-Current local settings:
+- loopback / desktop access (`localhost`, `127.0.0.1`, `::1`)
+  Settings are stored in `%USERPROFILE%\.grayshare\settings.json`
+- LAN / other-device browser access
+  Settings are stored in that browser's `localStorage`
+
+Current settings:
 
 - display name
 - theme
 - upload chunk size override
 - upload worker/thread override
 - receive list refresh interval
+
+### Desktop Port
+
+The desktop app can save a preferred port in Settings when it is opened on loopback.
+
+- the saved port is written to `%USERPROFILE%\.grayshare\app_config.json`
+- GrayShare checks whether that port is available
+- if available, the Restart button saves the port and restarts the desktop app
+
+If the saved port is unavailable on a future launch, GrayShare falls back to an automatic port and logs the issue to `startup.log`.
 
 ### Clear Data
 
@@ -94,6 +109,8 @@ It clears:
 
 It preserves:
 
+- `%USERPROFILE%\.grayshare\settings.json`
+- `%USERPROFILE%\.grayshare\app_config.json`
 - the webview/browser profile so `localStorage` settings remain available
 
 ## Download Strategy
@@ -191,6 +208,8 @@ Notable paths:
 - `%USERPROFILE%\.grayshare\inbox`
 - `%USERPROFILE%\.grayshare\webview`
 - `%USERPROFILE%\.grayshare\startup.log`
+- `%USERPROFILE%\.grayshare\settings.json`
+- `%USERPROFILE%\.grayshare\app_config.json`
 
 ## API Overview
 
@@ -213,6 +232,11 @@ Main endpoints:
 - `GET /api/activity`
 - `GET /api/inbox`
 - `GET /api/settings`
+- `GET /api/settings/client`
+- `PUT /api/settings/client`
+- `GET /api/app/config`
+- `GET /api/app/port-check`
+- `POST /api/app/restart`
 - `POST /api/data/clear`
 
 ## Troubleshooting
