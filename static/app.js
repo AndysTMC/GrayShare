@@ -324,8 +324,22 @@ if (shareFileInput && shareFileLabel) {
 const viewTransfer = document.getElementById("view-transfer");
 const viewHistory = document.getElementById("view-history");
 const viewSettings = document.getElementById("view-settings");
+const navHistory = document.getElementById("nav-history");
+const settingRefreshBlock = document.getElementById("setting-refresh")?.closest(".settings-block");
+const clearDataBlock = document.getElementById("clear-data")?.closest(".settings-block");
+
+function applyClientVisibility() {
+  if (isLoopbackOrigin()) return;
+  if (viewHistory) viewHistory.classList.add("hidden");
+  if (navHistory) navHistory.classList.add("hidden");
+  if (settingRefreshBlock) settingRefreshBlock.classList.add("hidden");
+  if (clearDataBlock) clearDataBlock.classList.add("hidden");
+}
 
 function showView(name) {
+  if (name === "history" && !isLoopbackOrigin()) {
+    name = "transfer";
+  }
   const map = {
     transfer: viewTransfer,
     history: viewHistory,
@@ -372,6 +386,20 @@ function normalizeClientSettings(raw = {}) {
 }
 
 async function loadClientSettings() {
+  if (isLoopbackOrigin()) {
+    try {
+      const res = await fetchWithTimeout("/api/settings/client", { method: "GET" }, HEALTH_PING_TIMEOUT_MS);
+      if (!res.ok) {
+        throw new Error("failed");
+      }
+      clientSettings = normalizeClientSettings(await res.json());
+      return;
+    } catch {
+      clientSettings = { ...DEFAULT_CLIENT_SETTINGS };
+      return;
+    }
+  }
+
   try {
     const raw = window.localStorage.getItem(CLIENT_SETTINGS_STORAGE_KEY);
     clientSettings = normalizeClientSettings(raw ? JSON.parse(raw) : DEFAULT_CLIENT_SETTINGS);
@@ -382,6 +410,18 @@ async function loadClientSettings() {
 
 async function saveClientSettings() {
   clientSettings = normalizeClientSettings(clientSettings);
+  if (isLoopbackOrigin()) {
+    const res = await fetch("/api/settings/client", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(clientSettings),
+    });
+    if (!res.ok) {
+      throw await parseResponseError(res, "Unable to save settings.");
+    }
+    clientSettings = normalizeClientSettings(await res.json());
+    return clientSettings;
+  }
   window.localStorage.setItem(
     CLIENT_SETTINGS_STORAGE_KEY,
     JSON.stringify(clientSettings),
@@ -1209,6 +1249,7 @@ stopShareBtn.addEventListener("click", async () => {
 });
 
 async function initApp() {
+  applyClientVisibility();
   setMode("idle");
   resetShareUi();
   await loadClientSettings();

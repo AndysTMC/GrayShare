@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import ipaddress
+import json
 import os
 import secrets
 import shutil
@@ -47,6 +48,7 @@ APP_DATA_DIR = (
 APP_DATA_DIR.mkdir(parents=True, exist_ok=True)
 INBOX_DIR = APP_DATA_DIR / "inbox"
 INBOX_DIR.mkdir(exist_ok=True)
+SETTINGS_FILE = APP_DATA_DIR / "settings.json"
 WEBVIEW_DATA_DIR = APP_DATA_DIR / "webview"
 
 # Large file I/O: avoid tiny default buffer; stream instead of loading whole file into RAM.
@@ -59,6 +61,13 @@ CHUNK_MAX_BYTES = int(os.getenv("CHUNK_MAX_BYTES", str(256 * 1024 * 1024)))  # 2
 
 ACTIVITY_MAX = 100
 activity_log: deque = deque(maxlen=ACTIVITY_MAX)
+DEFAULT_CLIENT_SETTINGS = {
+    "display_name": "",
+    "chunk_mb": 0,
+    "threads": 0,
+    "refresh_sec": 3,
+    "theme": "light",
+}
 
 
 def log_activity(kind: str, message: str, meta: Optional[Dict[str, Any]] = None) -> None:
@@ -73,11 +82,48 @@ def log_activity(kind: str, message: str, meta: Optional[Dict[str, Any]] = None)
     )
 
 
+def _normalize_client_settings(raw: Dict[str, Any] | None = None) -> ClientSettings:
+    data = dict(DEFAULT_CLIENT_SETTINGS)
+    if raw:
+        data.update(raw)
+    data["display_name"] = str(data.get("display_name", "")).strip()
+    theme = str(data.get("theme", "light")).lower().strip()
+    data["theme"] = "dark" if theme == "dark" else "light"
+    return ClientSettings.model_validate(data)
+
+
+def _load_client_settings_sync() -> ClientSettings:
+    if SETTINGS_FILE.is_file():
+        try:
+            raw = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            raw = DEFAULT_CLIENT_SETTINGS
+    else:
+        raw = DEFAULT_CLIENT_SETTINGS
+    settings = _normalize_client_settings(raw)
+    SETTINGS_FILE.write_text(
+        json.dumps(settings.model_dump(), indent=2),
+        encoding="utf-8",
+    )
+    return settings
+
+
+def _save_client_settings_sync(settings: ClientSettings) -> ClientSettings:
+    normalized = _normalize_client_settings(settings.model_dump())
+    SETTINGS_FILE.write_text(
+        json.dumps(normalized.model_dump(), indent=2),
+        encoding="utf-8",
+    )
+    return normalized
+
+
 def _clear_app_data_sync() -> tuple[int, int, List[str]]:
     deleted_items = 0
     preserved_items = 0
     skipped: List[str] = []
     preserve = set()
+    if SETTINGS_FILE.exists():
+        preserve.add(SETTINGS_FILE.resolve())
     if WEBVIEW_DATA_DIR.exists():
         preserve.add(WEBVIEW_DATA_DIR.resolve())
 
@@ -152,6 +198,14 @@ class NetworkInfo(BaseModel):
     port: int
     endpoint: str
     url: str
+
+
+class ClientSettings(BaseModel):
+    display_name: str = Field(default="", max_length=40)
+    chunk_mb: int = Field(default=0, ge=0, le=256)
+    threads: int = Field(default=0, ge=0, le=16)
+    refresh_sec: int = Field(default=3, ge=2, le=60)
+    theme: str = Field(default="light")
 
 
 class DataClearResult(BaseModel):
@@ -629,6 +683,16 @@ async def get_server_settings():
     )
 
 
+@app.get("/api/settings/client", response_model=ClientSettings)
+async def get_client_settings():
+    return await asyncio.to_thread(_load_client_settings_sync)
+
+
+@app.put("/api/settings/client", response_model=ClientSettings)
+async def update_client_settings(settings: ClientSettings):
+    return await asyncio.to_thread(_save_client_settings_sync, settings)
+
+
 @app.post("/api/data/clear", response_model=DataClearResult)
 async def clear_app_data():
     for session in list(share_sessions.values()):
@@ -641,6 +705,8 @@ async def clear_app_data():
     pending_chunked.clear()
     activity_log.clear()
     deleted_items, preserved_items, skipped = await asyncio.to_thread(_clear_app_data_sync)
+    if SETTINGS_FILE.exists():
+        skipped.append("settings.json preserved")
     if WEBVIEW_DATA_DIR.exists():
         skipped.append("webview profile preserved so local settings remain available")
     return DataClearResult(

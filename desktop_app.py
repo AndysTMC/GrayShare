@@ -461,7 +461,7 @@ def main():
         bridge.bind_window(window)
         webview.start(
             debug=False,
-            private_mode=True,
+            private_mode=False,
             storage_path=str(data_dir / "webview"),
         )
     except Exception as exc:
