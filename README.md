@@ -93,9 +93,28 @@ The desktop app can save a preferred port in Settings when it is opened on loopb
 
 - the saved port is written to `%USERPROFILE%\.grayshare\app_config.json`
 - GrayShare checks whether that port is available
-- if available, the Restart button saves the port and restarts the desktop app
+- if available, the `Save & Close` button saves the port and closes the desktop app
+
+Open GrayShare again after closing and it will use the saved port.
 
 If the saved port is unavailable on a future launch, GrayShare falls back to an automatic port and logs the issue to `startup.log`.
+
+### PWA
+
+GrayShare now includes a manifest, service worker, and install icons for supported browsers.
+
+Files involved:
+
+- `/manifest.webmanifest`
+- `/sw.js`
+- `/static/pwa-192.png`
+- `/static/pwa-512.png`
+
+Important limitation:
+
+- installability still depends on the browser allowing a secure context
+- `localhost` works
+- plain `http://<LAN-IP>:<port>` may still be non-installable on some devices/browsers
 
 ### Clear Data
 
@@ -236,7 +255,7 @@ Main endpoints:
 - `PUT /api/settings/client`
 - `GET /api/app/config`
 - `GET /api/app/port-check`
-- `POST /api/app/restart`
+- `POST /api/app/save-and-close`
 - `POST /api/data/clear`
 
 ## Troubleshooting

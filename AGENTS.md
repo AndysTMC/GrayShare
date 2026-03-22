@@ -61,9 +61,20 @@ The preferred desktop port is stored in:
 Loopback Settings can:
 
 - validate a candidate port with `/api/app/port-check`
-- save the chosen port and trigger a desktop restart with `/api/app/restart`
+- save the chosen port and close the desktop app with `/api/app/save-and-close`
 
 If the configured port is unavailable at startup, `desktop_app.py` falls back to an automatic port and logs the failure in `startup.log`.
+
+### PWA Assets
+
+The browser install surface uses:
+
+- `/manifest.webmanifest`
+- `/sw.js`
+- `static/pwa-192.png`
+- `static/pwa-512.png`
+
+Keep the manifest and service worker routes rooted at `/`, not under `/static`, so install scope stays correct.
 
 ### Clear Data
 

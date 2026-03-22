@@ -74,7 +74,7 @@ DEFAULT_APP_CONFIG = {
     "port": 0,
 }
 runtime_current_port = int(os.getenv("APP_PORT", "0") or "0")
-runtime_restart_callback: Optional[Callable[[int], None]] = None
+runtime_close_callback: Optional[Callable[[], None]] = None
 
 
 def log_activity(kind: str, message: str, meta: Optional[Dict[str, Any]] = None) -> None:
@@ -175,18 +175,18 @@ def _check_port_availability_sync(port: int, current_port: int) -> tuple[bool, s
             sock.bind(("0.0.0.0", port))
         except OSError:
             return False, f"Port {port} is not available."
-    return True, f"Port {port} is available. Restart to apply it."
+    return True, f"Port {port} is available. Save and close to apply it."
 
 
 def configure_runtime_control(
     *,
     current_port: int,
-    restart_callback: Optional[Callable[[int], None]] = None,
+    close_callback: Optional[Callable[[], None]] = None,
 ) -> None:
     global runtime_current_port
-    global runtime_restart_callback
+    global runtime_close_callback
     runtime_current_port = max(0, int(current_port or 0))
-    runtime_restart_callback = restart_callback
+    runtime_close_callback = close_callback
 
 
 def _clear_app_data_sync() -> tuple[int, int, List[str]]:
@@ -256,7 +256,7 @@ class AppConfig(BaseModel):
 class DesktopConfigState(BaseModel):
     configured_port: int = Field(default=0, ge=0, le=65535)
     current_port: int = Field(default=0, ge=0, le=65535)
-    restart_supported: bool
+    close_supported: bool
 
 
 class PortAvailability(BaseModel):
@@ -266,11 +266,11 @@ class PortAvailability(BaseModel):
     current_port: int = Field(default=0, ge=0, le=65535)
 
 
-class RestartRequest(BaseModel):
+class SaveAndCloseRequest(BaseModel):
     port: int = Field(ge=1, le=65535)
 
 
-class RestartResult(BaseModel):
+class SaveAndCloseResult(BaseModel):
     status: str
     port: int = Field(ge=1, le=65535)
     message: str
@@ -727,6 +727,23 @@ async def home(request: Request):
     return templates.TemplateResponse("index.html", {"request": request})
 
 
+@app.get("/manifest.webmanifest")
+async def web_manifest():
+    return FileResponse(
+        path=RESOURCE_DIR / "static" / "manifest.webmanifest",
+        media_type="application/manifest+json",
+    )
+
+
+@app.get("/sw.js")
+async def service_worker():
+    return FileResponse(
+        path=RESOURCE_DIR / "static" / "sw.js",
+        media_type="application/javascript",
+        headers={"Service-Worker-Allowed": "/"},
+    )
+
+
 @app.get("/api/shares", response_model=List[SharingUser])
 async def list_shares():
     return [
@@ -802,7 +819,7 @@ async def get_desktop_config(request: Request):
     return DesktopConfigState(
         configured_port=config.port,
         current_port=runtime_current_port,
-        restart_supported=runtime_restart_callback is not None,
+        close_supported=runtime_close_callback is not None,
     )
 
 
@@ -823,16 +840,16 @@ async def check_desktop_port(request: Request, port: int = Query(..., ge=1, le=6
     )
 
 
-@app.post("/api/app/restart", response_model=RestartResult)
-async def restart_desktop_app(
-    payload: RestartRequest,
+@app.post("/api/app/save-and-close", response_model=SaveAndCloseResult)
+async def save_and_close_desktop_app(
+    payload: SaveAndCloseRequest,
     request: Request,
     background_tasks: BackgroundTasks,
 ):
     if not _is_loopback_request(request):
-        raise HTTPException(status_code=403, detail="Desktop restart is only available locally.")
-    if runtime_restart_callback is None:
-        raise HTTPException(status_code=501, detail="Restart is not available in browser-only mode.")
+        raise HTTPException(status_code=403, detail="Desktop close is only available locally.")
+    if runtime_close_callback is None:
+        raise HTTPException(status_code=501, detail="Save and close is only available in the desktop app.")
     available, message = await asyncio.to_thread(
         _check_port_availability_sync,
         payload.port,
@@ -841,11 +858,11 @@ async def restart_desktop_app(
     if not available:
         raise HTTPException(status_code=409, detail=message)
     await asyncio.to_thread(_save_app_config_sync, AppConfig(port=payload.port))
-    background_tasks.add_task(runtime_restart_callback, payload.port)
-    return RestartResult(
-        status="restarting",
+    background_tasks.add_task(runtime_close_callback)
+    return SaveAndCloseResult(
+        status="closing",
         port=payload.port,
-        message=f"Restarting GrayShare on port {payload.port}.",
+        message=f"Saved port {payload.port}. GrayShare is closing.",
     )
 
 

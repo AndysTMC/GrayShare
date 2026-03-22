@@ -20,6 +20,7 @@ const receiveProgressFill = document.getElementById("receive-progress-fill");
 const shareFileInput = document.getElementById("share-file");
 const shareFileLabel = document.getElementById("share-file-label");
 const themeToggleBtn = document.getElementById("theme-toggle");
+const installAppBtn = document.getElementById("install-app");
 const serverEndpointEl = document.getElementById("server-endpoint");
 const showQrBtn = document.getElementById("show-qr");
 const qrWrap = document.getElementById("qr-wrap");
@@ -330,7 +331,7 @@ const settingRefreshBlock = document.getElementById("setting-refresh")?.closest(
 const clearDataBlock = document.getElementById("clear-data")?.closest(".settings-block");
 const settingPortInput = document.getElementById("setting-port");
 const settingPortStatus = document.getElementById("setting-port-status");
-const restartAppBtn = document.getElementById("restart-app");
+const saveCloseAppBtn = document.getElementById("save-close-app");
 
 function applyClientVisibility() {
   if (isLoopbackOrigin()) return;
@@ -376,10 +377,11 @@ let clientSettings = { ...DEFAULT_CLIENT_SETTINGS };
 let desktopConfig = {
   configured_port: 0,
   current_port: 0,
-  restart_supported: false,
+  close_supported: false,
 };
 let portCheckTimerId = null;
 let portCheckRequestId = 0;
+let deferredInstallPrompt = null;
 
 function clampInt(value, min, max, fallback) {
   const n = parseInt(value, 10);
@@ -693,9 +695,9 @@ function setPortStatus(message) {
   }
 }
 
-function setRestartButtonEnabled(enabled) {
-  if (restartAppBtn) {
-    restartAppBtn.disabled = !enabled;
+function setSaveCloseEnabled(enabled) {
+  if (saveCloseAppBtn) {
+    saveCloseAppBtn.disabled = !enabled;
   }
 }
 
@@ -709,9 +711,9 @@ async function loadDesktopConfig() {
     desktopConfig = await res.json();
     const preferredPort = desktopConfig.configured_port || desktopConfig.current_port || 0;
     settingPortInput.value = preferredPort > 0 ? String(preferredPort) : "";
-    if (!desktopConfig.restart_supported) {
-      setPortStatus("Restart is only available from the GrayShare desktop app.");
-      setRestartButtonEnabled(false);
+    if (!desktopConfig.close_supported) {
+      setPortStatus("Save and close is only available from the GrayShare desktop app.");
+      setSaveCloseEnabled(false);
       return;
     }
     if (preferredPort > 0) {
@@ -719,10 +721,10 @@ async function loadDesktopConfig() {
       return;
     }
     setPortStatus("Enter a port between 1 and 65535.");
-    setRestartButtonEnabled(false);
+    setSaveCloseEnabled(false);
   } catch (err) {
     setPortStatus(parseErrorDetail(err));
-    setRestartButtonEnabled(false);
+    setSaveCloseEnabled(false);
   }
 }
 
@@ -730,7 +732,7 @@ async function checkPortAvailability(port) {
   if (!isLoopbackOrigin()) return;
   const requestId = ++portCheckRequestId;
   setPortStatus(`Checking port ${port}...`);
-  setRestartButtonEnabled(false);
+  setSaveCloseEnabled(false);
   try {
     const res = await fetchWithTimeout(
       `/api/app/port-check?port=${encodeURIComponent(port)}`,
@@ -745,13 +747,13 @@ async function checkPortAvailability(port) {
     }
     const result = await res.json();
     setPortStatus(result.message || `Port ${port} checked.`);
-    setRestartButtonEnabled(Boolean(result.available && desktopConfig.restart_supported));
+    setSaveCloseEnabled(Boolean(result.available && desktopConfig.close_supported));
   } catch (err) {
     if (requestId !== portCheckRequestId) {
       return;
     }
     setPortStatus(parseErrorDetail(err));
-    setRestartButtonEnabled(false);
+    setSaveCloseEnabled(false);
   }
 }
 
@@ -762,7 +764,7 @@ function schedulePortAvailabilityCheck() {
   if (!parsed.valid) {
     portCheckRequestId += 1;
     setPortStatus(parsed.message);
-    setRestartButtonEnabled(false);
+    setSaveCloseEnabled(false);
     return;
   }
   portCheckTimerId = setTimeout(() => {
@@ -775,40 +777,94 @@ if (settingPortInput) {
   settingPortInput.addEventListener("change", schedulePortAvailabilityCheck);
 }
 
-if (restartAppBtn) {
-  restartAppBtn.addEventListener("click", async () => {
+if (saveCloseAppBtn) {
+  saveCloseAppBtn.addEventListener("click", async () => {
     const parsed = parsePortInput(settingPortInput?.value || "");
     if (!parsed.valid) {
       setPortStatus(parsed.message);
-      setRestartButtonEnabled(false);
+      setSaveCloseEnabled(false);
       return;
     }
 
-    const prevText = restartAppBtn.textContent;
-    restartAppBtn.disabled = true;
-    restartAppBtn.textContent = "Restarting...";
+    const prevText = saveCloseAppBtn.textContent;
+    saveCloseAppBtn.disabled = true;
+    saveCloseAppBtn.textContent = "Saving...";
     try {
-      const res = await fetch("/api/app/restart", {
+      const res = await fetch("/api/app/save-and-close", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ port: parsed.port }),
       });
       if (!res.ok) {
-        throw await parseResponseError(res, "Unable to restart GrayShare.");
+        throw await parseResponseError(res, "Unable to save GrayShare port.");
       }
       const result = await res.json();
       setPortStatus(result.message);
+      saveCloseAppBtn.textContent = "Closing...";
       showToast(result.message, "success");
-      if (!window.pywebview) {
-        window.setTimeout(() => {
-          window.location.href = `${window.location.protocol}//${window.location.hostname}:${parsed.port}/`;
-        }, 2500);
-      }
     } catch (err) {
-      restartAppBtn.textContent = prevText;
+      saveCloseAppBtn.textContent = prevText;
       showToast(parseErrorDetail(err), "error");
       schedulePortAvailabilityCheck();
     }
+  });
+}
+
+function isEmbeddedDesktopApp() {
+  return Boolean(window.pywebview);
+}
+
+async function unregisterServiceWorkers() {
+  if (!("serviceWorker" in navigator)) {
+    return;
+  }
+  try {
+    const regs = await navigator.serviceWorker.getRegistrations();
+    await Promise.all(regs.map((reg) => reg.unregister()));
+  } catch {
+  }
+}
+
+function registerServiceWorker() {
+  if (!("serviceWorker" in navigator) || !window.isSecureContext) {
+    return;
+  }
+  if (isEmbeddedDesktopApp()) {
+    void unregisterServiceWorkers();
+    return;
+  }
+  void navigator.serviceWorker.register("/sw.js").catch(() => {});
+}
+
+function setupInstallPrompt() {
+  if (!installAppBtn) return;
+  if (isEmbeddedDesktopApp()) {
+    installAppBtn.classList.add("hidden");
+    return;
+  }
+
+  window.addEventListener("beforeinstallprompt", (event) => {
+    event.preventDefault();
+    deferredInstallPrompt = event;
+    installAppBtn.classList.remove("hidden");
+  });
+
+  window.addEventListener("appinstalled", () => {
+    deferredInstallPrompt = null;
+    installAppBtn.classList.add("hidden");
+  });
+
+  installAppBtn.addEventListener("click", async () => {
+    if (!deferredInstallPrompt) {
+      return;
+    }
+    deferredInstallPrompt.prompt();
+    try {
+      await deferredInstallPrompt.userChoice;
+    } catch {
+    }
+    deferredInstallPrompt = null;
+    installAppBtn.classList.add("hidden");
   });
 }
 
@@ -1406,6 +1462,8 @@ async function initApp() {
   resetShareUi();
   await loadClientSettings();
   setupTheme();
+  setupInstallPrompt();
+  registerServiceWorker();
   await loadSettingsPanel();
   configureSharePolling();
   setupNetworkInfo();

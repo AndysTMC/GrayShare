@@ -6,8 +6,6 @@ import os
 import shutil
 import socket
 import ssl
-import subprocess
-import sys
 import traceback
 import tempfile
 import threading
@@ -362,91 +360,43 @@ class DesktopController:
         self.args = args
         self.log_file = log_file
         self.window = None
-        self._restarting = False
+        self._closing = False
 
     def bind_window(self, window) -> None:
         self.window = window
 
-    def request_restart(self, port: int) -> None:
-        if self._restarting:
+    def request_close(self) -> None:
+        if self._closing:
             return
-        self._restarting = True
-        append_startup_log(self.log_file, f"Restart requested for port {port}.")
+        self._closing = True
+        append_startup_log(self.log_file, "Save and close requested.")
         threading.Thread(
-            target=self._restart_worker,
-            args=(port,),
+            target=self._close_current_app,
             daemon=True,
-            name="GrayShareRestart",
+            name="GrayShareClose",
         ).start()
 
-    def _restart_worker(self, port: int) -> None:
-        try:
-            command = self._build_restart_command(port)
-            self._launch_detached(command)
-            append_startup_log(
-                self.log_file,
-                f"Queued GrayShare restart on port {port}.",
-            )
-            time.sleep(0.4)
+    def _close_current_app(self) -> None:
+        def _force_exit_later() -> None:
+            time.sleep(8)
             os._exit(0)
-        except Exception:
-            self._restarting = False
-            append_startup_log(
-                self.log_file,
-                "Restart request failed:\n"
-                f"{traceback.format_exc().rstrip()}",
-            )
 
-    def _build_restart_command(self, port: int) -> list[str]:
-        if getattr(sys, "frozen", False):
-            command = [sys.executable]
-        else:
-            command = [sys.executable, str(Path(__file__).resolve())]
-        command.extend(
-            [
-                "--port",
-                str(port),
-                "--width",
-                str(self.args.width),
-                "--height",
-                str(self.args.height),
-                "--title",
-                self.args.title,
-            ]
-        )
-        if self.args.tls and not self.args.no_tls:
-            command.append("--tls")
-        if self.args.no_tls:
-            command.append("--no-tls")
-        return command
-
-    def _launch_detached(self, command: list[str]) -> None:
-        def _ps_quote(value: str) -> str:
-            return "'" + value.replace("'", "''") + "'"
-
-        quoted_args = ", ".join(_ps_quote(arg) for arg in command[1:])
-        script = (
-            f"Start-Sleep -Seconds 1; Start-Process -FilePath {_ps_quote(command[0])}"
-        )
-        if quoted_args:
-            script += f" -ArgumentList @({quoted_args})"
-        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-        subprocess.Popen(
-            [
-                "powershell",
-                "-NoProfile",
-                "-ExecutionPolicy",
-                "Bypass",
-                "-WindowStyle",
-                "Hidden",
-                "-Command",
-                script,
-            ],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            creationflags=creationflags,
-        )
+        threading.Thread(
+            target=_force_exit_later,
+            daemon=True,
+            name="GrayShareCloseWatchdog",
+        ).start()
+        if self.window is not None:
+            try:
+                self.window.destroy()
+                return
+            except Exception:
+                append_startup_log(
+                    self.log_file,
+                    "Window destroy during close failed:\n"
+                    f"{traceback.format_exc().rstrip()}",
+                )
+        os._exit(0)
 
 
 def purge_deferred_data(data_dir: Path) -> None:
@@ -454,6 +404,28 @@ def purge_deferred_data(data_dir: Path) -> None:
     if not marker.exists():
         return
     marker.unlink(missing_ok=True)
+
+
+def purge_webview_service_workers(data_dir: Path, log_file: Path | None = None) -> None:
+    webview_root = data_dir / "webview" / "EBWebView" / "Default"
+    cleanup_targets = [
+        webview_root / "Service Worker",
+        webview_root / "Code Cache",
+    ]
+    for target in cleanup_targets:
+        if not target.exists():
+            continue
+        try:
+            shutil.rmtree(target, ignore_errors=False)
+            if log_file:
+                append_startup_log(log_file, f"Cleared stale webview cache: {target.name}")
+        except Exception:
+            if log_file:
+                append_startup_log(
+                    log_file,
+                    "Unable to clear webview cache:\n"
+                    f"{traceback.format_exc().rstrip()}",
+                )
 
 
 def main():
@@ -470,6 +442,7 @@ def main():
     os.environ["APP_HOST_IP"] = host_ip
     log_file = data_dir / "startup.log"
     append_startup_log(log_file, "Launching GrayShare desktop app.")
+    purge_webview_service_workers(data_dir, log_file=log_file)
     controller = DesktopController(args, log_file)
     temp_dir = Path(tempfile.mkdtemp(prefix="grayshare_"))
     bind_host = "0.0.0.0"
@@ -577,7 +550,7 @@ def main():
         if hasattr(server_main, "configure_runtime_control"):
             server_main.configure_runtime_control(
                 current_port=port,
-                restart_callback=controller.request_restart,
+                close_callback=controller.request_close,
             )
     except Exception:
         append_startup_log(

@@ -5,6 +5,9 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>GrayShare</title>
+  <meta name="theme-color" content="#121212" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <link rel="manifest" href="/manifest.webmanifest" />
   <link rel="icon" type="image/x-icon" href="/static/app_icon.ico" />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
@@ -18,7 +21,10 @@
   <div class="app">
     <header class="app-header">
       <h1 class="app-title">GrayShare</h1>
-      <button type="button" id="theme-toggle" class="theme-toggle">Dark</button>
+      <div class="header-actions">
+        <button type="button" id="install-app" class="btn-toolbar hidden">Install App</button>
+        <button type="button" id="theme-toggle" class="theme-toggle">Dark</button>
+      </div>
     </header>
 
     <!-- Transfer: main send/receive experience -->
@@ -160,8 +166,8 @@
           <input type="number" id="setting-port" class="form__input" min="1" max="65535" step="1"
             placeholder="e.g. 50123" />
         </div>
-        <p id="setting-port-status" class="form__hint">Choose the GrayShare port for this PC, then restart to apply it.</p>
-        <button type="button" id="restart-app" class="btn-primary" disabled>Restart</button>
+        <p id="setting-port-status" class="form__hint">Choose the GrayShare port for this PC, then save and close to apply it on the next launch.</p>
+        <button type="button" id="save-close-app" class="btn-primary" disabled>Save &amp; Close</button>
       </div>
       <div class="settings-block">
         <button type="button" id="clear-data" class="btn-stop">Clear Data</button>
