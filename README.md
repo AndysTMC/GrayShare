@@ -2,6 +2,10 @@
 
 GrayShare is a Windows LAN file-sharing app with a packaged desktop executable and a browser client for other devices on the same network.
 
+<p align="center">
+    <img src="./images/GrayShareImg.jpg" alt="Gray Share Demo Image" width="500"/>
+</p>
+
 ## What It Does
 
 - share files from one device to others on the LAN
