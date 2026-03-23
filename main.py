@@ -60,6 +60,7 @@ STREAM_CHUNK_BYTES = int(os.getenv("FILE_STREAM_CHUNK_BYTES", str(1024 * 1024)))
 # Chunked transfer (parallel upload / parallel download)
 CHUNK_MIN_BYTES = int(os.getenv("CHUNK_MIN_BYTES", str(256 * 1024)))  # 256 KiB
 CHUNK_MAX_BYTES = int(os.getenv("CHUNK_MAX_BYTES", str(256 * 1024 * 1024)))  # 256 MiB
+SHARE_SESSION_STALE_SECONDS = int(os.getenv("SHARE_SESSION_STALE_SECONDS", "15"))
 
 ACTIVITY_MAX = 100
 activity_log: deque = deque(maxlen=ACTIVITY_MAX)
@@ -67,7 +68,7 @@ DEFAULT_CLIENT_SETTINGS = {
     "display_name": "",
     "chunk_mb": 0,
     "threads": 0,
-    "refresh_sec": 3,
+    "refresh_sec": 5,
     "theme": "light",
 }
 DEFAULT_APP_CONFIG = {
@@ -276,6 +277,12 @@ class SaveAndCloseResult(BaseModel):
     message: str
 
 
+class AppConfigSaveResult(BaseModel):
+    configured_port: int = Field(default=0, ge=0, le=65535)
+    current_port: int = Field(default=0, ge=0, le=65535)
+    message: str
+
+
 class ShareInitBody(BaseModel):
     display_name: str
     filename: str
@@ -305,7 +312,7 @@ class ClientSettings(BaseModel):
     display_name: str = Field(default="", max_length=40)
     chunk_mb: int = Field(default=0, ge=0, le=256)
     threads: int = Field(default=0, ge=0, le=16)
-    refresh_sec: int = Field(default=3, ge=2, le=60)
+    refresh_sec: int = Field(default=5, ge=2, le=60)
     theme: str = Field(default="light")
 
 
@@ -338,6 +345,7 @@ class ShareSession:
     active: bool = True
     # If > 0, clients may use GET /api/receive/{id}/chunk/{i} with this chunk size.
     transfer_chunk_size: int = 0
+    last_seen_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
 
 @dataclass
@@ -671,6 +679,55 @@ def _get_active_session(sharer_id: str, passcode: Optional[str]) -> ShareSession
     return session
 
 
+def _is_share_session_stale(
+    session: ShareSession,
+    now: datetime | None = None,
+) -> bool:
+    current = now or datetime.now(timezone.utc)
+    return (current - session.last_seen_at).total_seconds() > SHARE_SESSION_STALE_SECONDS
+
+
+async def _remove_share_session(
+    sharer_id: str,
+    *,
+    reason: str,
+    missing_ok: bool = False,
+) -> tuple[ShareSession | None, bool]:
+    session = share_sessions.pop(sharer_id, None)
+    if not session:
+        if missing_ok:
+            return None, False
+        raise HTTPException(status_code=404, detail="Share session not found.")
+    session.active = False
+    deleted_file = await storage.delete_file(session.storage_uri)
+    message = (
+        f'{session.display_name} stopped sharing "{session.filename}"'
+        if reason == "manual"
+        else f'{session.display_name} is no longer sharing "{session.filename}"'
+    )
+    log_activity(
+        "share_stop",
+        message,
+        {
+            "sharer_id": sharer_id,
+            "filename": session.filename,
+            "reason": reason,
+        },
+    )
+    return session, deleted_file
+
+
+async def _prune_stale_share_sessions() -> None:
+    now = datetime.now(timezone.utc)
+    stale_ids = [
+        sharer_id
+        for sharer_id, session in list(share_sessions.items())
+        if session.active and _is_share_session_stale(session, now)
+    ]
+    for sharer_id in stale_ids:
+        await _remove_share_session(sharer_id, reason="stale", missing_ok=True)
+
+
 def _build_receive_response(session: ShareSession):
     if not isinstance(storage, SMBStorage):
         path = _resolved_path_under_inbox(session.storage_uri)
@@ -746,6 +803,7 @@ async def service_worker():
 
 @app.get("/api/shares", response_model=List[SharingUser])
 async def list_shares():
+    await _prune_stale_share_sessions()
     return [
         SharingUser(
             sharer_id=session.sharer_id,
@@ -820,6 +878,27 @@ async def get_desktop_config(request: Request):
         configured_port=config.port,
         current_port=runtime_current_port,
         close_supported=runtime_close_callback is not None,
+    )
+
+
+@app.put("/api/app/config", response_model=AppConfigSaveResult)
+async def update_desktop_config(config: AppConfig, request: Request):
+    if not _is_loopback_request(request):
+        raise HTTPException(status_code=403, detail="Desktop settings are only available locally.")
+    if config.port < 1 or config.port > 65535:
+        raise HTTPException(status_code=400, detail="Enter a port between 1 and 65535.")
+    available, message = await asyncio.to_thread(
+        _check_port_availability_sync,
+        config.port,
+        runtime_current_port,
+    )
+    if not available:
+        raise HTTPException(status_code=409, detail=message)
+    saved = await asyncio.to_thread(_save_app_config_sync, config)
+    return AppConfigSaveResult(
+        configured_port=saved.port,
+        current_port=runtime_current_port,
+        message=f"Port {saved.port} saved. The change will take effect the next time you open GrayShare.",
     )
 
 
@@ -1025,6 +1104,7 @@ async def receive_info(
     sharer_id: str,
     passcode: Optional[str] = Query(default=None),
 ):
+    await _prune_stale_share_sessions()
     session = _get_active_session(sharer_id, passcode)
     cs, cc = _chunk_spec(session)
     return ReceiveInfo(
@@ -1043,6 +1123,7 @@ async def receive_chunk_get(
     chunk_index: int,
     passcode: Optional[str] = Query(default=None),
 ):
+    await _prune_stale_share_sessions()
     session = _get_active_session(sharer_id, passcode)
 
     cs, cc = _chunk_spec(session)
@@ -1127,21 +1208,22 @@ async def start_share(
 
 @app.post("/api/share/{sharer_id}/stop")
 async def stop_share(sharer_id: str):
-    session = share_sessions.pop(sharer_id, None)
-    if not session:
-        raise HTTPException(status_code=404, detail="Share session not found.")
-    session.active = False
-    deleted_file = await storage.delete_file(session.storage_uri)
-    log_activity(
-        "share_stop",
-        f'{session.display_name} stopped sharing "{session.filename}"',
-        {"sharer_id": sharer_id, "filename": session.filename},
-    )
+    _, deleted_file = await _remove_share_session(sharer_id, reason="manual")
     return {"status": "stopped", "deleted_file": deleted_file}
+
+
+@app.post("/api/share/{sharer_id}/heartbeat")
+async def share_heartbeat(sharer_id: str):
+    session = share_sessions.get(sharer_id)
+    if not session or not session.active:
+        raise HTTPException(status_code=404, detail="Share session not found.")
+    session.last_seen_at = datetime.now(timezone.utc)
+    return {"ok": True}
 
 
 @app.post("/api/receive/{sharer_id}")
 async def receive_file(sharer_id: str, passcode: Optional[str] = Form(default=None)):
+    await _prune_stale_share_sessions()
     session = _get_active_session(sharer_id, passcode)
 
     log_activity(
@@ -1162,6 +1244,7 @@ async def receive_file_download(
     sharer_id: str,
     passcode: Optional[str] = Query(default=None),
 ):
+    await _prune_stale_share_sessions()
     session = _get_active_session(sharer_id, passcode)
     log_activity(
         "receive",
@@ -1182,6 +1265,7 @@ async def receive_file_save_local(
     payload: LocalSaveRequest,
     request: Request,
 ):
+    await _prune_stale_share_sessions()
     if not _is_loopback_request(request):
         raise HTTPException(
             status_code=403,

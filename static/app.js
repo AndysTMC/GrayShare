@@ -34,6 +34,7 @@ let receiveHealthTimerId = null;
 let networkRefreshTimerId = null;
 let qrVisible = false;
 let qrInstance = null;
+let shareHeartbeatTimerId = null;
 
 const DOWNLOAD_RETRY_LIMIT = 5;
 const DOWNLOAD_BASE_BACKOFF_MS = 400;
@@ -41,6 +42,7 @@ const DOWNLOAD_TIMEOUT_MS = 20000;
 const HEALTH_PING_INTERVAL_MS = 5000;
 const HEALTH_PING_TIMEOUT_MS = 3000;
 const NETWORK_REFRESH_MS = 10000;
+const SHARE_HEARTBEAT_MS = 5000;
 
 function formatBytes(n) {
   if (n == null || Number.isNaN(n) || n < 0) return "0 B";
@@ -334,11 +336,12 @@ const settingPortStatus = document.getElementById("setting-port-status");
 const saveCloseAppBtn = document.getElementById("save-close-app");
 
 function applyClientVisibility() {
+  if (settingRefreshBlock) settingRefreshBlock.remove();
+  if (saveCloseAppBtn) saveCloseAppBtn.remove();
   if (isLoopbackOrigin()) return;
   if (viewHistory) viewHistory.classList.add("hidden");
   if (navHistory) navHistory.classList.add("hidden");
   if (portSettingsBlock) portSettingsBlock.classList.add("hidden");
-  if (settingRefreshBlock) settingRefreshBlock.classList.add("hidden");
   if (clearDataBlock) clearDataBlock.classList.add("hidden");
 }
 
@@ -369,7 +372,7 @@ const DEFAULT_CLIENT_SETTINGS = {
   display_name: "",
   chunk_mb: 0,
   threads: 0,
-  refresh_sec: 3,
+  refresh_sec: 5,
   theme: "light",
 };
 const CLIENT_SETTINGS_STORAGE_KEY = "grayshare.clientSettings";
@@ -394,7 +397,7 @@ function normalizeClientSettings(raw = {}) {
     display_name: typeof raw.display_name === "string" ? raw.display_name.trim() : "",
     chunk_mb: clampInt(raw.chunk_mb ?? 0, 0, 256, 0),
     threads: clampInt(raw.threads ?? 0, 0, 16, 0),
-    refresh_sec: clampInt(raw.refresh_sec ?? 3, 2, 60, 3),
+    refresh_sec: 5,
     theme: raw.theme === "dark" ? "dark" : "light",
   };
 }
@@ -456,7 +459,7 @@ function getThreads() {
 }
 
 function getRefreshSec() {
-  return clientSettings.refresh_sec || 3;
+  return 5;
 }
 
 let pollTimerId = null;
@@ -609,11 +612,9 @@ async function loadSettingsPanel() {
   const nameInput = document.getElementById("setting-display-name");
   const chunkInput = document.getElementById("setting-chunk-mb");
   const threadsInput = document.getElementById("setting-threads");
-  const refreshInput = document.getElementById("setting-refresh");
   if (nameInput) nameInput.value = getDisplayName();
   if (chunkInput) chunkInput.value = String(getChunkMb());
   if (threadsInput) threadsInput.value = String(getThreads());
-  if (refreshInput) refreshInput.value = String(getRefreshSec());
   if (isLoopbackOrigin()) {
     await loadDesktopConfig();
   }
@@ -621,21 +622,6 @@ async function loadSettingsPanel() {
 
 const activityRefreshBtn = document.getElementById("activity-refresh");
 if (activityRefreshBtn) activityRefreshBtn.addEventListener("click", () => loadActivityList());
-
-const settingRefreshInput = document.getElementById("setting-refresh");
-if (settingRefreshInput) {
-  settingRefreshInput.addEventListener("change", async () => {
-    const v = Math.min(60, Math.max(2, parseInt(settingRefreshInput.value, 10) || 3));
-    clientSettings.refresh_sec = v;
-    settingRefreshInput.value = String(v);
-    configureSharePolling();
-    try {
-      await saveClientSettings();
-    } catch (err) {
-      showToast(parseErrorDetail(err), "error");
-    }
-  });
-}
 
 const settingDisplayName = document.getElementById("setting-display-name");
 if (settingDisplayName) {
@@ -695,12 +681,6 @@ function setPortStatus(message) {
   }
 }
 
-function setSaveCloseEnabled(enabled) {
-  if (saveCloseAppBtn) {
-    saveCloseAppBtn.disabled = !enabled;
-  }
-}
-
 async function loadDesktopConfig() {
   if (!isLoopbackOrigin() || !settingPortInput) return;
   try {
@@ -711,49 +691,62 @@ async function loadDesktopConfig() {
     desktopConfig = await res.json();
     const preferredPort = desktopConfig.configured_port || desktopConfig.current_port || 0;
     settingPortInput.value = preferredPort > 0 ? String(preferredPort) : "";
-    if (!desktopConfig.close_supported) {
-      setPortStatus("Save and close is only available from the GrayShare desktop app.");
-      setSaveCloseEnabled(false);
-      return;
-    }
     if (preferredPort > 0) {
       await checkPortAvailability(preferredPort);
       return;
     }
     setPortStatus("Enter a port between 1 and 65535.");
-    setSaveCloseEnabled(false);
   } catch (err) {
     setPortStatus(parseErrorDetail(err));
-    setSaveCloseEnabled(false);
   }
 }
 
-async function checkPortAvailability(port) {
+async function fetchPortAvailability(port) {
+  const res = await fetchWithTimeout(
+    `/api/app/port-check?port=${encodeURIComponent(port)}`,
+    { method: "GET" },
+    HEALTH_PING_TIMEOUT_MS,
+  );
+  if (!res.ok) {
+    throw await parseResponseError(res, "Unable to check port.");
+  }
+  return res.json();
+}
+
+async function savePortConfig(port) {
+  const res = await fetch("/api/app/config", {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ port }),
+  });
+  if (!res.ok) {
+    throw await parseResponseError(res, "Unable to save port.");
+  }
+  const result = await res.json();
+  desktopConfig.configured_port = result.configured_port;
+  setPortStatus(result.message);
+  return result;
+}
+
+async function checkPortAvailability(port, { save = false } = {}) {
   if (!isLoopbackOrigin()) return;
   const requestId = ++portCheckRequestId;
   setPortStatus(`Checking port ${port}...`);
-  setSaveCloseEnabled(false);
   try {
-    const res = await fetchWithTimeout(
-      `/api/app/port-check?port=${encodeURIComponent(port)}`,
-      { method: "GET" },
-      HEALTH_PING_TIMEOUT_MS,
-    );
-    if (!res.ok) {
-      throw await parseResponseError(res, "Unable to check port.");
-    }
+    const result = await fetchPortAvailability(port);
     if (requestId !== portCheckRequestId) {
       return;
     }
-    const result = await res.json();
+    if (save && result.available) {
+      await savePortConfig(port);
+      return;
+    }
     setPortStatus(result.message || `Port ${port} checked.`);
-    setSaveCloseEnabled(Boolean(result.available && desktopConfig.close_supported));
   } catch (err) {
     if (requestId !== portCheckRequestId) {
       return;
     }
     setPortStatus(parseErrorDetail(err));
-    setSaveCloseEnabled(false);
   }
 }
 
@@ -764,7 +757,6 @@ function schedulePortAvailabilityCheck() {
   if (!parsed.valid) {
     portCheckRequestId += 1;
     setPortStatus(parsed.message);
-    setSaveCloseEnabled(false);
     return;
   }
   portCheckTimerId = setTimeout(() => {
@@ -774,36 +766,16 @@ function schedulePortAvailabilityCheck() {
 
 if (settingPortInput) {
   settingPortInput.addEventListener("input", schedulePortAvailabilityCheck);
-  settingPortInput.addEventListener("change", schedulePortAvailabilityCheck);
-}
-
-if (saveCloseAppBtn) {
-  saveCloseAppBtn.addEventListener("click", async () => {
-    const parsed = parsePortInput(settingPortInput?.value || "");
+  settingPortInput.addEventListener("change", async () => {
+    const parsed = parsePortInput(settingPortInput.value);
     if (!parsed.valid) {
       setPortStatus(parsed.message);
-      setSaveCloseEnabled(false);
       return;
     }
-
-    const prevText = saveCloseAppBtn.textContent;
-    saveCloseAppBtn.disabled = true;
-    saveCloseAppBtn.textContent = "Saving...";
     try {
-      const res = await fetch("/api/app/save-and-close", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ port: parsed.port }),
-      });
-      if (!res.ok) {
-        throw await parseResponseError(res, "Unable to save GrayShare port.");
-      }
-      const result = await res.json();
-      setPortStatus(result.message);
-      saveCloseAppBtn.textContent = "Closing...";
-      showToast(result.message, "success");
+      await checkPortAvailability(parsed.port, { save: true });
+      showToast("Port saved for the next launch.", "success");
     } catch (err) {
-      saveCloseAppBtn.textContent = prevText;
       showToast(parseErrorDetail(err), "error");
       schedulePortAvailabilityCheck();
     }
@@ -958,6 +930,63 @@ function triggerNativeBrowserDownload(share, passcode) {
   link.click();
   setTimeout(() => link.remove(), 1000);
 }
+
+function stopShareHeartbeat() {
+  if (shareHeartbeatTimerId) {
+    clearInterval(shareHeartbeatTimerId);
+    shareHeartbeatTimerId = null;
+  }
+}
+
+async function resetSenderState(message, kind = "error") {
+  stopShareHeartbeat();
+  localSharerId = null;
+  resetShareUi();
+  setMode("idle");
+  setShareStatus(message, kind);
+  setTimeout(() => {
+    shareStatus.classList.add("hidden");
+  }, 1800);
+  await refreshShares();
+}
+
+function startShareHeartbeat() {
+  stopShareHeartbeat();
+  if (!localSharerId) return;
+  shareHeartbeatTimerId = setInterval(async () => {
+    if (!localSharerId) return;
+    try {
+      const res = await fetch(`/api/share/${localSharerId}/heartbeat`, { method: "POST" });
+      if (!res.ok) {
+        throw new Error("Share heartbeat failed.");
+      }
+    } catch {
+      await resetSenderState("Sharing ended because the sender session was lost.");
+    }
+  }, SHARE_HEARTBEAT_MS);
+}
+
+function stopShareBeacon(sharerId) {
+  const url = `/api/share/${sharerId}/stop`;
+  try {
+    if (navigator.sendBeacon) {
+      const payload = new Blob([""], { type: "text/plain;charset=UTF-8" });
+      navigator.sendBeacon(url, payload);
+      return;
+    }
+  } catch {
+  }
+  void fetch(url, { method: "POST", keepalive: true }).catch(() => {});
+}
+
+function notifyShareStopOnUnload() {
+  if (!localSharerId) return;
+  stopShareBeacon(localSharerId);
+  localSharerId = null;
+}
+
+window.addEventListener("pagehide", notifyShareStopOnUnload);
+window.addEventListener("beforeunload", notifyShareStopOnUnload);
 
 function parseErrorDetail(err) {
   if (!err) return "Something went wrong.";
@@ -1408,6 +1437,7 @@ shareForm.addEventListener("submit", async (e) => {
     shareSubmit.classList.add("hidden");
     stopShareBtn.classList.remove("hidden");
     setShareStatus("Sharing started. You are now sender-only.", "success");
+    startShareHeartbeat();
     uploadProgressBar.classList.remove("indeterminate");
     uploadProgressFill.style.width = "100%";
     uploadProgressText.textContent = "Complete.";
@@ -1446,6 +1476,7 @@ stopShareBtn.addEventListener("click", async () => {
     } catch {
     }
   }
+  stopShareHeartbeat();
   localSharerId = null;
   resetShareUi();
   setShareStatus("Sharing stopped. You can receive again.", "success");
