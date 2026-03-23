@@ -35,6 +35,7 @@ let networkRefreshTimerId = null;
 let qrVisible = false;
 let qrInstance = null;
 let shareHeartbeatTimerId = null;
+const clientLogRecent = new Map();
 
 const DOWNLOAD_RETRY_LIMIT = 5;
 const DOWNLOAD_BASE_BACKOFF_MS = 400;
@@ -385,6 +386,8 @@ let desktopConfig = {
 let portCheckTimerId = null;
 let portCheckRequestId = 0;
 let deferredInstallPrompt = null;
+let installPromptAutoAttempted = false;
+let installPromptInFlight = false;
 
 function clampInt(value, min, max, fallback) {
   const n = parseInt(value, 10);
@@ -620,6 +623,72 @@ async function loadSettingsPanel() {
   }
 }
 
+function normalizeLogValue(value, depth = 0) {
+  if (value == null) return value;
+  if (depth > 3) return "[truncated]";
+  if (value instanceof Error) {
+    return {
+      name: value.name,
+      message: value.message,
+      stack: value.stack || "",
+    };
+  }
+  if (Array.isArray(value)) {
+    return value.slice(0, 8).map((item) => normalizeLogValue(item, depth + 1));
+  }
+  if (typeof value === "object") {
+    const out = {};
+    for (const [key, item] of Object.entries(value).slice(0, 12)) {
+      out[key] = normalizeLogValue(item, depth + 1);
+    }
+    return out;
+  }
+  if (typeof value === "string" && value.length > 500) {
+    return `${value.slice(0, 500)}…`;
+  }
+  return value;
+}
+
+function reportClientLog(level, message, details = {}) {
+  try {
+    const normalizedLevel = String(level || "INFO").toUpperCase();
+    const normalizedMessage = String(message || "").trim();
+    if (!normalizedMessage) return;
+
+    const dedupeKey = `${normalizedLevel}|${normalizedMessage}|${window.location.pathname}`;
+    const now = Date.now();
+    const lastTs = clientLogRecent.get(dedupeKey) || 0;
+    if (now - lastTs < 15000) {
+      return;
+    }
+    clientLogRecent.set(dedupeKey, now);
+    for (const [key, ts] of clientLogRecent.entries()) {
+      if (now - ts > 60000) clientLogRecent.delete(key);
+    }
+
+    const payload = {
+      level: normalizedLevel,
+      message: normalizedMessage,
+      source: "app.js",
+      page: window.location.href,
+      user_agent: navigator.userAgent || "",
+      details: normalizeLogValue(details),
+    };
+    const body = JSON.stringify(payload);
+    if (navigator.sendBeacon) {
+      const ok = navigator.sendBeacon("/api/log/client", new Blob([body], { type: "application/json" }));
+      if (ok) return;
+    }
+    void fetch("/api/log/client", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body,
+      keepalive: true,
+    }).catch(() => {});
+  } catch {
+  }
+}
+
 const activityRefreshBtn = document.getElementById("activity-refresh");
 if (activityRefreshBtn) activityRefreshBtn.addEventListener("click", () => loadActivityList());
 
@@ -691,6 +760,16 @@ async function loadDesktopConfig() {
     desktopConfig = await res.json();
     const preferredPort = desktopConfig.configured_port || desktopConfig.current_port || 0;
     settingPortInput.value = preferredPort > 0 ? String(preferredPort) : "";
+    if (
+      desktopConfig.configured_port > 0 &&
+      desktopConfig.current_port > 0 &&
+      desktopConfig.configured_port !== desktopConfig.current_port
+    ) {
+      setPortStatus(
+        `Configured port ${desktopConfig.configured_port} is busy. GrayShare is running on temporary port ${desktopConfig.current_port} for this launch.`,
+      );
+      return;
+    }
     if (preferredPort > 0) {
       await checkPortAvailability(preferredPort);
       return;
@@ -808,17 +887,54 @@ function registerServiceWorker() {
   void navigator.serviceWorker.register("/sw.js").catch(() => {});
 }
 
+async function promptForInstall({ auto = false } = {}) {
+  if (!installAppBtn || !deferredInstallPrompt || installPromptInFlight) {
+    return;
+  }
+  installPromptInFlight = true;
+  if (auto) {
+    installPromptAutoAttempted = true;
+  }
+  try {
+    deferredInstallPrompt.prompt();
+    const choice = await deferredInstallPrompt.userChoice.catch(() => null);
+    if (choice?.outcome === "accepted") {
+      installAppBtn.classList.add("hidden");
+    } else {
+      installAppBtn.classList.remove("hidden");
+    }
+  } catch {
+    installAppBtn.classList.remove("hidden");
+  } finally {
+    deferredInstallPrompt = null;
+    installPromptInFlight = false;
+  }
+}
+
 function setupInstallPrompt() {
   if (!installAppBtn) return;
   if (isEmbeddedDesktopApp()) {
     installAppBtn.classList.add("hidden");
     return;
   }
+  if (window.matchMedia?.("(display-mode: standalone)").matches || window.navigator.standalone) {
+    installAppBtn.classList.add("hidden");
+    return;
+  }
+  if (!window.isSecureContext) {
+    installAppBtn.classList.remove("hidden");
+    installAppBtn.textContent = "Install App";
+  }
 
   window.addEventListener("beforeinstallprompt", (event) => {
     event.preventDefault();
     deferredInstallPrompt = event;
     installAppBtn.classList.remove("hidden");
+    if (!installPromptAutoAttempted) {
+      setTimeout(() => {
+        void promptForInstall({ auto: true });
+      }, 250);
+    }
   });
 
   window.addEventListener("appinstalled", () => {
@@ -828,15 +944,12 @@ function setupInstallPrompt() {
 
   installAppBtn.addEventListener("click", async () => {
     if (!deferredInstallPrompt) {
+      if (!window.isSecureContext) {
+        showToast("PWA install needs HTTPS or localhost. Plain LAN browser URLs may not show the install prompt.", "error");
+      }
       return;
     }
-    deferredInstallPrompt.prompt();
-    try {
-      await deferredInstallPrompt.userChoice;
-    } catch {
-    }
-    deferredInstallPrompt = null;
-    installAppBtn.classList.add("hidden");
+    await promptForInstall();
   });
 }
 
@@ -960,7 +1073,11 @@ function startShareHeartbeat() {
       if (!res.ok) {
         throw new Error("Share heartbeat failed.");
       }
-    } catch {
+    } catch (err) {
+      reportClientLog("WARN", "Share heartbeat failed on the client.", {
+        sharer_id: localSharerId,
+        error: err,
+      });
       await resetSenderState("Sharing ended because the sender session was lost.");
     }
   }, SHARE_HEARTBEAT_MS);
@@ -999,6 +1116,23 @@ function parseErrorDetail(err) {
   if (err.message) return err.message;
   return "Something went wrong.";
 }
+
+window.addEventListener("error", (event) => {
+  reportClientLog("ERROR", "Unhandled browser error.", {
+    message: event?.message || "",
+    filename: event?.filename || "",
+    lineno: event?.lineno || 0,
+    colno: event?.colno || 0,
+    error: event?.error || null,
+  });
+});
+
+window.addEventListener("unhandledrejection", (event) => {
+  reportClientLog("ERROR", "Unhandled promise rejection.", {
+    reason: parseErrorDetail(event?.reason),
+    error: event?.reason || null,
+  });
+});
 
 function showToast(message, kind = "error") {
   const root = document.getElementById("toast-root");
@@ -1351,6 +1485,11 @@ async function refreshShares() {
         receiveOverlayStatus.textContent = "Done — check your downloads folder.";
         await new Promise((r) => setTimeout(r, 600));
       } catch (err) {
+        reportClientLog("ERROR", "Receive operation failed in the client.", {
+          sharer_id: share.sharer_id,
+          filename: share.filename,
+          error: err,
+        });
         showToast(parseErrorDetail(err), "error");
       } finally {
         receiveInProgress = false;
@@ -1447,6 +1586,11 @@ shareForm.addEventListener("submit", async (e) => {
       uploadProgressText.textContent = "";
     }, 800);
   } catch (err) {
+    reportClientLog("ERROR", "Share submission failed in the client.", {
+      filename: file?.name || "",
+      display_name: displayName,
+      error: err,
+    });
     const msg =
       err && typeof err === "object" && "detail" in err
         ? err.detail
@@ -1501,4 +1645,7 @@ async function initApp() {
   await refreshShares();
 }
 
-initApp();
+initApp().catch((err) => {
+  reportClientLog("ERROR", "GrayShare frontend initialization failed.", { error: err });
+  showToast(parseErrorDetail(err), "error");
+});
