@@ -8,6 +8,8 @@ import secrets
 import shutil
 import socket
 import sys
+import threading
+import traceback
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -52,6 +54,7 @@ INBOX_DIR.mkdir(exist_ok=True)
 SETTINGS_FILE = APP_DATA_DIR / "settings.json"
 APP_CONFIG_FILE = APP_DATA_DIR / "app_config.json"
 WEBVIEW_DATA_DIR = APP_DATA_DIR / "webview"
+BACKEND_LOG_FILE = APP_DATA_DIR / "backend.log"
 
 # Large file I/O: avoid tiny default buffer; stream instead of loading whole file into RAM.
 COPY_BUFFER_BYTES = int(os.getenv("FILE_IO_BUFFER_BYTES", str(8 * 1024 * 1024)))  # 8 MiB
@@ -72,10 +75,27 @@ DEFAULT_CLIENT_SETTINGS = {
     "theme": "light",
 }
 DEFAULT_APP_CONFIG = {
-    "port": 0,
+    "port": 4567,
 }
 runtime_current_port = int(os.getenv("APP_PORT", "0") or "0")
+runtime_host_ip = str(os.getenv("APP_HOST_IP", "") or "").strip()
 runtime_close_callback: Optional[Callable[[], None]] = None
+backend_log_lock = threading.Lock()
+VALID_LOG_LEVELS = {"DEBUG", "INFO", "WARN", "ERROR"}
+
+
+def append_backend_log(message: str, *, level: str = "INFO") -> None:
+    try:
+        BACKEND_LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.now().astimezone().isoformat(timespec="seconds")
+        normalized_level = str(level or "INFO").upper().strip()
+        if normalized_level not in VALID_LOG_LEVELS:
+            normalized_level = "INFO"
+        with backend_log_lock:
+            with BACKEND_LOG_FILE.open("a", encoding="utf-8") as fh:
+                fh.write(f"[{timestamp}] [{normalized_level}] {message}\n")
+    except Exception:
+        pass
 
 
 def log_activity(kind: str, message: str, meta: Optional[Dict[str, Any]] = None) -> None:
@@ -88,6 +108,29 @@ def log_activity(kind: str, message: str, meta: Optional[Dict[str, Any]] = None)
             "meta": meta or {},
         }
     )
+    meta_text = ""
+    if meta:
+        try:
+            meta_text = f" | {json.dumps(meta, sort_keys=True, ensure_ascii=False)}"
+        except Exception:
+            meta_text = f" | {meta!r}"
+    append_backend_log(f"[activity:{kind}] {message}{meta_text}")
+
+
+def log_backend_event(
+    level: str,
+    scope: str,
+    message: str,
+    *,
+    meta: Optional[Dict[str, Any]] = None,
+) -> None:
+    meta_text = ""
+    if meta:
+        try:
+            meta_text = f" | {json.dumps(meta, sort_keys=True, ensure_ascii=False)}"
+        except Exception:
+            meta_text = f" | {meta!r}"
+    append_backend_log(f"[{scope}] {message}{meta_text}", level=level)
 
 
 def _normalize_client_settings(raw: Dict[str, Any] | None = None) -> ClientSettings:
@@ -105,11 +148,11 @@ def _normalize_app_config(raw: Dict[str, Any] | None = None) -> AppConfig:
     if raw:
         data.update(raw)
     try:
-        data["port"] = int(data.get("port", 0))
+        data["port"] = int(data.get("port", 4567))
     except Exception:
-        data["port"] = 0
-    if data["port"] < 0 or data["port"] > 65535:
-        data["port"] = 0
+        data["port"] = 4567
+    if data["port"] < 1 or data["port"] > 65535:
+        data["port"] = 4567
     return AppConfig.model_validate(data)
 
 
@@ -118,6 +161,10 @@ def _load_client_settings_sync() -> ClientSettings:
         try:
             raw = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
         except Exception:
+            append_backend_log(
+                "Failed to read settings.json. Recreating defaults.\n"
+                f"{traceback.format_exc().rstrip()}"
+            )
             raw = DEFAULT_CLIENT_SETTINGS
     else:
         raw = DEFAULT_CLIENT_SETTINGS
@@ -126,6 +173,7 @@ def _load_client_settings_sync() -> ClientSettings:
         json.dumps(settings.model_dump(), indent=2),
         encoding="utf-8",
     )
+    append_backend_log(f"Client settings loaded from {SETTINGS_FILE}.")
     return settings
 
 
@@ -135,6 +183,11 @@ def _save_client_settings_sync(settings: ClientSettings) -> ClientSettings:
         json.dumps(normalized.model_dump(), indent=2),
         encoding="utf-8",
     )
+    append_backend_log(
+        f"Client settings saved to {SETTINGS_FILE}."
+        f" display_name={normalized.display_name!r} theme={normalized.theme!r}"
+        f" chunk_mb={normalized.chunk_mb} threads={normalized.threads}"
+    )
     return normalized
 
 
@@ -143,6 +196,10 @@ def _load_app_config_sync() -> AppConfig:
         try:
             raw = json.loads(APP_CONFIG_FILE.read_text(encoding="utf-8"))
         except Exception:
+            append_backend_log(
+                "Failed to read app_config.json. Recreating defaults.\n"
+                f"{traceback.format_exc().rstrip()}"
+            )
             raw = DEFAULT_APP_CONFIG
     else:
         raw = DEFAULT_APP_CONFIG
@@ -151,6 +208,7 @@ def _load_app_config_sync() -> AppConfig:
         json.dumps(config.model_dump(), indent=2),
         encoding="utf-8",
     )
+    append_backend_log(f"App config loaded from {APP_CONFIG_FILE}. port={config.port}")
     return config
 
 
@@ -160,6 +218,7 @@ def _save_app_config_sync(config: AppConfig) -> AppConfig:
         json.dumps(normalized.model_dump(), indent=2),
         encoding="utf-8",
     )
+    append_backend_log(f"App config saved to {APP_CONFIG_FILE}. port={normalized.port}")
     return normalized
 
 
@@ -176,18 +235,24 @@ def _check_port_availability_sync(port: int, current_port: int) -> tuple[bool, s
             sock.bind(("0.0.0.0", port))
         except OSError:
             return False, f"Port {port} is not available."
-    return True, f"Port {port} is available. Save and close to apply it."
+    return True, f"Port {port} is available. The saved change will apply next time you open GrayShare."
 
 
 def configure_runtime_control(
     *,
     current_port: int,
+    host_ip: str | None = None,
     close_callback: Optional[Callable[[], None]] = None,
 ) -> None:
     global runtime_current_port
+    global runtime_host_ip
     global runtime_close_callback
     runtime_current_port = max(0, int(current_port or 0))
+    runtime_host_ip = str(host_ip or runtime_host_ip or "").strip()
     runtime_close_callback = close_callback
+    append_backend_log(
+        f"Runtime control configured. current_port={runtime_current_port} host_ip={runtime_host_ip or 'unset'}"
+    )
 
 
 def _clear_app_data_sync() -> tuple[int, int, List[str]]:
@@ -216,6 +281,11 @@ def _clear_app_data_sync() -> tuple[int, int, List[str]]:
             skipped.append(f"{path.name}: {exc}")
 
     INBOX_DIR.mkdir(parents=True, exist_ok=True)
+    append_backend_log(
+        f"Clear data completed. deleted={deleted_items} preserved={preserved_items} skipped={len(skipped)}"
+    )
+    for skipped_item in skipped:
+        append_backend_log(f"Clear data skipped item: {skipped_item}")
     return deleted_items, preserved_items, skipped
 
 
@@ -330,6 +400,15 @@ class LocalSaveRequest(BaseModel):
 class LocalSaveResult(BaseModel):
     saved_path: str
     size_bytes: int
+
+
+class FrontendLogPayload(BaseModel):
+    level: str = Field(default="ERROR", max_length=10)
+    message: str = Field(default="", max_length=1000)
+    source: str = Field(default="frontend", max_length=80)
+    page: str = Field(default="", max_length=500)
+    user_agent: str = Field(default="", max_length=500)
+    details: Dict[str, Any] = Field(default_factory=dict)
 
 
 @dataclass
@@ -486,6 +565,26 @@ app.mount("/static", StaticFiles(directory=str(RESOURCE_DIR / "static")), name="
 storage = build_storage()
 share_sessions: Dict[str, ShareSession] = {}
 pending_chunked: Dict[str, PendingChunkedUpload] = {}
+append_backend_log(
+    "Backend initialized. "
+    f"pid={os.getpid()} "
+    f"storage_backend={type(storage).__name__} "
+    f"storage_mode={os.getenv('FILES_STORAGE_MODE', 'local').lower().strip()} "
+    f"app_data={APP_DATA_DIR}"
+)
+
+
+@app.middleware("http")
+async def log_unhandled_request_errors(request: Request, call_next):
+    try:
+        return await call_next(request)
+    except Exception:
+        append_backend_log(
+            f"Unhandled request error for {request.method} {request.url.path}\n"
+            f"{traceback.format_exc().rstrip()}",
+            level="ERROR",
+        )
+        raise
 
 
 def _chunk_spec(session: ShareSession) -> Tuple[int, int]:
@@ -565,6 +664,17 @@ async def _finalize_chunked_upload(pending: PendingChunkedUpload) -> ShareSessio
     size = await asyncio.to_thread(lambda: final_path.stat().st_size)
     if size != pending.total_size:
         await asyncio.to_thread(final_path.unlink, missing_ok=True)
+        log_backend_event(
+            "WARN",
+            "transfer",
+            "Merged chunked upload size mismatch.",
+            meta={
+                "sharer_id": pending.sharer_id,
+                "filename": safe_name,
+                "expected_size": pending.total_size,
+                "actual_size": size,
+            },
+        )
         raise HTTPException(
             status_code=400,
             detail=(
@@ -712,6 +822,17 @@ async def _remove_share_session(
             "sharer_id": sharer_id,
             "filename": session.filename,
             "reason": reason,
+        },
+    )
+    log_backend_event(
+        "WARN" if not deleted_file else "INFO",
+        "transfer",
+        "Share session removed.",
+        meta={
+            "sharer_id": sharer_id,
+            "filename": session.filename,
+            "reason": reason,
+            "deleted_file": deleted_file,
         },
     )
     return session, deleted_file
@@ -977,8 +1098,8 @@ async def health():
 
 @app.get("/api/network/info", response_model=NetworkInfo)
 async def network_info():
-    port = int(os.getenv("APP_PORT", "8000"))
-    ip = _detect_local_ip()
+    port = runtime_current_port or int(os.getenv("APP_PORT", "8000"))
+    ip = runtime_host_ip or await asyncio.to_thread(_detect_local_ip)
     scheme = os.getenv("APP_SCHEME", "http").lower().strip() or "http"
     return NetworkInfo(
         ip=ip,
@@ -993,6 +1114,25 @@ async def upload_probe(request: Request):
     """Discard body; used by the client to estimate upload throughput."""
     await request.body()
     return Response(status_code=204)
+
+
+@app.post("/api/log/client")
+async def client_log(payload: FrontendLogPayload):
+    level = str(payload.level or "ERROR").upper().strip()
+    if level not in VALID_LOG_LEVELS:
+        level = "INFO"
+    log_backend_event(
+        level,
+        "frontend",
+        payload.message or "Client-side log event",
+        meta={
+            "source": payload.source,
+            "page": payload.page,
+            "user_agent": payload.user_agent,
+            "details": payload.details,
+        },
+    )
+    return {"ok": True}
 
 
 @app.post("/api/share/init")
@@ -1035,6 +1175,19 @@ async def share_init(body: ShareInitBody):
         parts_dir=parts_dir,
     )
     pending_chunked[sharer_id] = pending
+    log_backend_event(
+        "INFO",
+        "transfer",
+        "Chunked share initialized.",
+        meta={
+            "sharer_id": sharer_id,
+            "filename": safe_name,
+            "display_name": display_name,
+            "total_size": body.total_size,
+            "chunk_size": body.chunk_size,
+            "total_chunks": total_chunks,
+        },
+    )
     return {"sharer_id": sharer_id, "total_chunks": total_chunks}
 
 
@@ -1048,11 +1201,28 @@ async def share_finalize(sharer_id: str):
     needed = set(range(pending.total_chunks))
     if pending.received != needed:
         missing = needed - pending.received
+        log_backend_event(
+            "WARN",
+            "transfer",
+            "Chunked share finalize rejected because chunks are missing.",
+            meta={"sharer_id": sharer_id, "missing_chunks": sorted(missing)},
+        )
         raise HTTPException(
             status_code=400,
             detail=f"Missing chunks: {sorted(missing)}.",
         )
     session = await _finalize_chunked_upload(pending)
+    log_backend_event(
+        "INFO",
+        "transfer",
+        "Chunked share finalized.",
+        meta={
+            "sharer_id": session.sharer_id,
+            "filename": session.filename,
+            "size_bytes": session.size_bytes,
+            "chunk_size": session.transfer_chunk_size,
+        },
+    )
     return {"sharer_id": session.sharer_id, "filename": session.filename}
 
 
@@ -1090,6 +1260,17 @@ async def share_upload_chunk(
             if part_path.exists():
                 part_path.unlink(missing_ok=True)
             pending.received.discard(chunk_index)
+            log_backend_event(
+                "WARN",
+                "transfer",
+                "Chunk upload rejected because its size did not match expectation.",
+                meta={
+                    "sharer_id": sharer_id,
+                    "chunk_index": chunk_index,
+                    "expected_size": expected,
+                    "actual_size": size,
+                },
+            )
             raise HTTPException(
                 status_code=400,
                 detail=f"Chunk size mismatch: expected {expected} bytes, got {size}.",
@@ -1107,6 +1288,17 @@ async def receive_info(
     await _prune_stale_share_sessions()
     session = _get_active_session(sharer_id, passcode)
     cs, cc = _chunk_spec(session)
+    log_backend_event(
+        "INFO",
+        "transfer",
+        "Receiver requested share metadata.",
+        meta={
+            "sharer_id": sharer_id,
+            "filename": session.filename,
+            "chunk_count": cc,
+            "has_passcode": bool(session.passcode),
+        },
+    )
     return ReceiveInfo(
         filename=session.filename,
         size_bytes=session.size_bytes,
@@ -1194,6 +1386,17 @@ async def start_share(
         transfer_chunk_size=0,
     )
     share_sessions[sharer_id] = session
+    log_backend_event(
+        "INFO",
+        "transfer",
+        "Single-request share created.",
+        meta={
+            "sharer_id": sharer_id,
+            "filename": session.filename,
+            "size_bytes": session.size_bytes,
+            "display_name": session.display_name,
+        },
+    )
     log_activity(
         "share_start",
         f'{session.display_name} is sharing "{session.filename}"',
@@ -1208,6 +1411,7 @@ async def start_share(
 
 @app.post("/api/share/{sharer_id}/stop")
 async def stop_share(sharer_id: str):
+    log_backend_event("INFO", "transfer", "Manual stop requested for share.", meta={"sharer_id": sharer_id})
     _, deleted_file = await _remove_share_session(sharer_id, reason="manual")
     return {"status": "stopped", "deleted_file": deleted_file}
 
@@ -1225,6 +1429,12 @@ async def share_heartbeat(sharer_id: str):
 async def receive_file(sharer_id: str, passcode: Optional[str] = Form(default=None)):
     await _prune_stale_share_sessions()
     session = _get_active_session(sharer_id, passcode)
+    log_backend_event(
+        "INFO",
+        "transfer",
+        "Standard receive requested.",
+        meta={"sharer_id": sharer_id, "filename": session.filename, "mode": "post-form"},
+    )
 
     log_activity(
         "receive",
@@ -1246,6 +1456,12 @@ async def receive_file_download(
 ):
     await _prune_stale_share_sessions()
     session = _get_active_session(sharer_id, passcode)
+    log_backend_event(
+        "INFO",
+        "transfer",
+        "Browser-native download requested.",
+        meta={"sharer_id": sharer_id, "filename": session.filename, "mode": "browser-native"},
+    )
     log_activity(
         "receive",
         f'Browser download started: "{session.filename}" from {session.display_name}',
@@ -1286,6 +1502,16 @@ async def receive_file_save_local(
     if not target_path.parent.exists():
         raise HTTPException(status_code=400, detail="Target folder does not exist.")
 
+    log_backend_event(
+        "INFO",
+        "transfer",
+        "Desktop local save requested.",
+        meta={
+            "sharer_id": sharer_id,
+            "filename": session.filename,
+            "target_path": str(target_path),
+        },
+    )
     size = await asyncio.to_thread(_copy_session_to_local_path_sync, session, target_path)
     log_activity(
         "receive",
