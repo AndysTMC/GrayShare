@@ -20,7 +20,6 @@ const receiveProgressFill = document.getElementById("receive-progress-fill");
 const shareFileInput = document.getElementById("share-file");
 const shareFileLabel = document.getElementById("share-file-label");
 const themeToggleBtn = document.getElementById("theme-toggle");
-const installAppBtn = document.getElementById("install-app");
 const serverEndpointEl = document.getElementById("server-endpoint");
 const showQrBtn = document.getElementById("show-qr");
 const qrWrap = document.getElementById("qr-wrap");
@@ -36,6 +35,15 @@ let qrVisible = false;
 let qrInstance = null;
 let shareHeartbeatTimerId = null;
 const clientLogRecent = new Map();
+let serverEndpointUrl = "";
+let lastQrValue = "";
+let networkInfoInFlight = false;
+let refreshSharesInFlight = false;
+let receiveHealthInFlight = false;
+let shareHeartbeatInFlight = false;
+let lastSharesRenderKey = "";
+let activePointerCount = 0;
+let deferUiRefreshUntil = 0;
 
 const DOWNLOAD_RETRY_LIMIT = 5;
 const DOWNLOAD_BASE_BACKOFF_MS = 400;
@@ -44,6 +52,31 @@ const HEALTH_PING_INTERVAL_MS = 5000;
 const HEALTH_PING_TIMEOUT_MS = 3000;
 const NETWORK_REFRESH_MS = 10000;
 const SHARE_HEARTBEAT_MS = 5000;
+
+function noteUiInteraction(delayMs = 450) {
+  deferUiRefreshUntil = Math.max(deferUiRefreshUntil, Date.now() + delayMs);
+}
+
+function isUiInteractionActive() {
+  return activePointerCount > 0 || Date.now() < deferUiRefreshUntil;
+}
+
+window.addEventListener("pointerdown", () => {
+  activePointerCount += 1;
+  noteUiInteraction(900);
+}, true);
+
+function releaseUiInteraction(delayMs = 450) {
+  activePointerCount = Math.max(0, activePointerCount - 1);
+  noteUiInteraction(delayMs);
+}
+
+window.addEventListener("pointerup", () => releaseUiInteraction(), true);
+window.addEventListener("pointercancel", () => releaseUiInteraction(650), true);
+window.addEventListener("blur", () => {
+  activePointerCount = 0;
+  noteUiInteraction(250);
+}, true);
 
 function formatBytes(n) {
   if (n == null || Number.isNaN(n) || n < 0) return "0 B";
@@ -145,7 +178,8 @@ async function uploadFileInChunks(file, displayName, passcode, onChunkProgress, 
     const err = await initRes.json().catch(() => ({}));
     throw err;
   }
-  const { sharer_id, total_chunks: serverChunks } = await initRes.json();
+  const initData = await initRes.json();
+  const { sharer_id, total_chunks: serverChunks } = initData;
   const nChunks = serverChunks ?? Math.max(1, Math.ceil(file.size / chunkBytes));
 
   let done = 0;
@@ -179,7 +213,13 @@ async function uploadFileInChunks(file, displayName, passcode, onChunkProgress, 
     const err = await finalRes.json().catch(() => ({}));
     throw err;
   }
-  return { sharer_id };
+  const finalData = await finalRes.json().catch(() => ({}));
+  return {
+    sharer_id,
+    url: finalData?.url || initData?.url || "",
+    endpoint: finalData?.endpoint || initData?.endpoint || "",
+    ...finalData,
+  };
 }
 
 async function downloadFileAdaptive(share, passcode, onProgress) {
@@ -385,9 +425,6 @@ let desktopConfig = {
 };
 let portCheckTimerId = null;
 let portCheckRequestId = 0;
-let deferredInstallPrompt = null;
-let installPromptAutoAttempted = false;
-let installPromptInFlight = false;
 
 function clampInt(value, min, max, fallback) {
   const n = parseInt(value, 10);
@@ -467,8 +504,11 @@ function getRefreshSec() {
 
 let pollTimerId = null;
 function configureSharePolling() {
-  if (pollTimerId) clearInterval(pollTimerId);
-  pollTimerId = setInterval(refreshShares, getRefreshSec() * 1000);
+  if (pollTimerId) clearTimeout(pollTimerId);
+  pollTimerId = setTimeout(async function runSharePoll() {
+    await refreshShares({ allowDefer: true });
+    pollTimerId = setTimeout(runSharePoll, getRefreshSec() * 1000);
+  }, getRefreshSec() * 1000);
 }
 
 function getTheme() {
@@ -498,32 +538,85 @@ function setupTheme() {
   });
 }
 
+function sanitizeServerUrl(value) {
+  const text = typeof value === "string" ? value.trim() : "";
+  if (!text) return "";
+  if (/^undefined$/i.test(text) || /^null$/i.test(text)) return "";
+  if (text.includes("undefined") || text.includes("null")) return "";
+  try {
+    return new URL(text, window.location.origin).toString();
+  } catch {
+    return "";
+  }
+}
+
+function resolveServerUrl(data = {}) {
+  const directUrl = sanitizeServerUrl(data?.url);
+  if (directUrl) return directUrl;
+
+  const ip = typeof data?.ip === "string" ? data.ip.trim() : "";
+  const port = Number.parseInt(data?.port, 10);
+  if (ip && Number.isInteger(port) && port > 0 && port <= 65535) {
+    const base = `${window.location.protocol}//${ip}:${port}/`;
+    return sanitizeServerUrl(base);
+  }
+
+  return sanitizeServerUrl(window.location.origin ? `${window.location.origin}/` : "");
+}
+
+function updateServerEndpoint(url) {
+  if (!serverEndpointEl) return;
+  const nextUrl = sanitizeServerUrl(url);
+  if (nextUrl === serverEndpointUrl) {
+    if (qrVisible) {
+      renderQr(nextUrl);
+    }
+    return;
+  }
+  serverEndpointUrl = nextUrl;
+  serverEndpointEl.textContent = `URL: ${nextUrl || "unavailable"}`;
+  serverEndpointEl.title = nextUrl || "unavailable";
+  if (qrVisible) {
+    renderQr(nextUrl);
+  } else if (!nextUrl) {
+    lastQrValue = "";
+  }
+}
+
 async function loadNetworkInfo() {
   if (!serverEndpointEl) return;
+  if (networkInfoInFlight) return;
+  if (document.hidden) return;
+  if (isUiInteractionActive()) {
+    noteUiInteraction(250);
+    return;
+  }
+  networkInfoInFlight = true;
   try {
     const res = await fetchWithTimeout("/api/network/info", { method: "GET" }, HEALTH_PING_TIMEOUT_MS);
     if (!res.ok) {
       throw new Error("failed");
     }
     const data = await res.json();
-    const url = data?.url || "";
-    serverEndpointEl.textContent = `URL: ${url || "unavailable"}`;
-    serverEndpointEl.title = url || "unavailable";
-    if (qrVisible) {
-      renderQr(url);
-    }
+    updateServerEndpoint(resolveServerUrl(data));
   } catch {
-    serverEndpointEl.textContent = "URL: unavailable";
-    serverEndpointEl.title = "unavailable";
+    if (!serverEndpointUrl) {
+      updateServerEndpoint("");
+    }
+  } finally {
+    networkInfoInFlight = false;
   }
 }
 
 function renderQr(url) {
   if (!qrCodeEl || !qrTextEl) return;
   const value = url || "";
+  if (value === lastQrValue) return;
+  lastQrValue = value;
   qrCodeEl.innerHTML = "";
   qrTextEl.textContent = value;
   if (!value || !window.QRCode) {
+    qrInstance = null;
     return;
   }
   qrInstance = new window.QRCode(qrCodeEl, {
@@ -537,17 +630,19 @@ function renderQr(url) {
 }
 
 function setupNetworkInfo() {
-  loadNetworkInfo();
-  if (networkRefreshTimerId) clearInterval(networkRefreshTimerId);
-  networkRefreshTimerId = setInterval(loadNetworkInfo, NETWORK_REFRESH_MS);
+  void loadNetworkInfo();
+  if (networkRefreshTimerId) clearTimeout(networkRefreshTimerId);
+  networkRefreshTimerId = setTimeout(async function runNetworkRefresh() {
+    await loadNetworkInfo();
+    networkRefreshTimerId = setTimeout(runNetworkRefresh, NETWORK_REFRESH_MS);
+  }, NETWORK_REFRESH_MS);
   if (!showQrBtn || !qrWrap) return;
   showQrBtn.addEventListener("click", () => {
     qrVisible = !qrVisible;
     qrWrap.classList.toggle("hidden", !qrVisible);
     showQrBtn.textContent = qrVisible ? "Hide QR" : "Show QR";
     if (qrVisible) {
-      const url = (serverEndpointEl?.textContent || "").replace(/^URL:\s*/i, "").trim();
-      renderQr(url);
+      renderQr(serverEndpointUrl);
     }
   });
 }
@@ -887,72 +982,6 @@ function registerServiceWorker() {
   void navigator.serviceWorker.register("/sw.js").catch(() => {});
 }
 
-async function promptForInstall({ auto = false } = {}) {
-  if (!installAppBtn || !deferredInstallPrompt || installPromptInFlight) {
-    return;
-  }
-  installPromptInFlight = true;
-  if (auto) {
-    installPromptAutoAttempted = true;
-  }
-  try {
-    deferredInstallPrompt.prompt();
-    const choice = await deferredInstallPrompt.userChoice.catch(() => null);
-    if (choice?.outcome === "accepted") {
-      installAppBtn.classList.add("hidden");
-    } else {
-      installAppBtn.classList.remove("hidden");
-    }
-  } catch {
-    installAppBtn.classList.remove("hidden");
-  } finally {
-    deferredInstallPrompt = null;
-    installPromptInFlight = false;
-  }
-}
-
-function setupInstallPrompt() {
-  if (!installAppBtn) return;
-  if (isEmbeddedDesktopApp()) {
-    installAppBtn.classList.add("hidden");
-    return;
-  }
-  if (window.matchMedia?.("(display-mode: standalone)").matches || window.navigator.standalone) {
-    installAppBtn.classList.add("hidden");
-    return;
-  }
-  if (!window.isSecureContext) {
-    installAppBtn.classList.remove("hidden");
-    installAppBtn.textContent = "Install App";
-  }
-
-  window.addEventListener("beforeinstallprompt", (event) => {
-    event.preventDefault();
-    deferredInstallPrompt = event;
-    installAppBtn.classList.remove("hidden");
-    if (!installPromptAutoAttempted) {
-      setTimeout(() => {
-        void promptForInstall({ auto: true });
-      }, 250);
-    }
-  });
-
-  window.addEventListener("appinstalled", () => {
-    deferredInstallPrompt = null;
-    installAppBtn.classList.add("hidden");
-  });
-
-  installAppBtn.addEventListener("click", async () => {
-    if (!deferredInstallPrompt) {
-      if (!window.isSecureContext) {
-        showToast("PWA install needs HTTPS or localhost. Plain LAN browser URLs may not show the install prompt.", "error");
-      }
-      return;
-    }
-    await promptForInstall();
-  });
-}
-
 function saveBlob(filename, blob) {
   const url = URL.createObjectURL(blob);
   const link = document.createElement("a");
@@ -1046,9 +1075,10 @@ function triggerNativeBrowserDownload(share, passcode) {
 
 function stopShareHeartbeat() {
   if (shareHeartbeatTimerId) {
-    clearInterval(shareHeartbeatTimerId);
+    clearTimeout(shareHeartbeatTimerId);
     shareHeartbeatTimerId = null;
   }
+  shareHeartbeatInFlight = false;
 }
 
 async function resetSenderState(message, kind = "error") {
@@ -1066,10 +1096,19 @@ async function resetSenderState(message, kind = "error") {
 function startShareHeartbeat() {
   stopShareHeartbeat();
   if (!localSharerId) return;
-  shareHeartbeatTimerId = setInterval(async () => {
+  shareHeartbeatTimerId = setTimeout(async function runShareHeartbeat() {
     if (!localSharerId) return;
+    if (shareHeartbeatInFlight) {
+      shareHeartbeatTimerId = setTimeout(runShareHeartbeat, SHARE_HEARTBEAT_MS);
+      return;
+    }
+    shareHeartbeatInFlight = true;
     try {
-      const res = await fetch(`/api/share/${localSharerId}/heartbeat`, { method: "POST" });
+      const res = await fetchWithTimeout(
+        `/api/share/${localSharerId}/heartbeat`,
+        { method: "POST" },
+        HEALTH_PING_TIMEOUT_MS,
+      );
       if (!res.ok) {
         throw new Error("Share heartbeat failed.");
       }
@@ -1079,7 +1118,11 @@ function startShareHeartbeat() {
         error: err,
       });
       await resetSenderState("Sharing ended because the sender session was lost.");
+      return;
+    } finally {
+      shareHeartbeatInFlight = false;
     }
+    shareHeartbeatTimerId = setTimeout(runShareHeartbeat, SHARE_HEARTBEAT_MS);
   }, SHARE_HEARTBEAT_MS);
 }
 
@@ -1227,24 +1270,33 @@ async function postFormWithDownloadProgressRetry(url, formData, onProgress, maxA
 
 function startReceiveHealthPing() {
   stopReceiveHealthPing();
-  receiveHealthTimerId = setInterval(async () => {
+  receiveHealthTimerId = setTimeout(async function runReceiveHealthPing() {
     if (!receiveInProgress) return;
+    if (receiveHealthInFlight) {
+      receiveHealthTimerId = setTimeout(runReceiveHealthPing, HEALTH_PING_INTERVAL_MS);
+      return;
+    }
+    receiveHealthInFlight = true;
     try {
       const res = await fetchWithTimeout("/api/health", { method: "GET" }, HEALTH_PING_TIMEOUT_MS);
       if (!res.ok) {
         throw new Error("Health check failed");
       }
     } catch {
-      receiveOverlayStatus.textContent = "Connection unstable. Reconnecting…";
+      receiveOverlayStatus.textContent = "Connection unstable. Reconnecting...";
+    } finally {
+      receiveHealthInFlight = false;
     }
+    receiveHealthTimerId = setTimeout(runReceiveHealthPing, HEALTH_PING_INTERVAL_MS);
   }, HEALTH_PING_INTERVAL_MS);
 }
 
 function stopReceiveHealthPing() {
   if (receiveHealthTimerId) {
-    clearInterval(receiveHealthTimerId);
+    clearTimeout(receiveHealthTimerId);
     receiveHealthTimerId = null;
   }
+  receiveHealthInFlight = false;
 }
 
 function showReceiveOverlay(filename) {
@@ -1355,13 +1407,28 @@ function postFormWithUploadProgress(url, formData, onProgress) {
   });
 }
 
-async function refreshShares() {
+function setSharesEmptyState(message) {
+  const renderKey = `empty:${message}`;
+  if (renderKey === lastSharesRenderKey) {
+    return;
+  }
+  lastSharesRenderKey = renderKey;
+  sharesList.innerHTML = `<li class="empty">${message}</li>`;
+}
+
+async function refreshShares({ allowDefer = false } = {}) {
   if (!viewTransfer || viewTransfer.classList.contains("hidden")) {
     return;
   }
-  if (localSharerId || receiveInProgress) {
+  if (localSharerId || receiveInProgress || refreshSharesInFlight || document.hidden) {
     return;
   }
+  if (allowDefer && isUiInteractionActive()) {
+    noteUiInteraction(250);
+    return;
+  }
+
+  refreshSharesInFlight = true;
   let shares = [];
   try {
     const res = await fetchWithTimeout("/api/shares", { method: "GET" }, HEALTH_PING_TIMEOUT_MS);
@@ -1370,15 +1437,36 @@ async function refreshShares() {
     }
     shares = await res.json();
   } catch {
-    sharesList.innerHTML = '<li class="empty">Connection issue. Retrying…</li>';
-    return;
-  }
-  sharesList.innerHTML = "";
-  if (!shares.length) {
-    sharesList.innerHTML = '<li class="empty">No active sharers right now.</li>';
+    setSharesEmptyState("Connection issue. Retrying...");
+    refreshSharesInFlight = false;
     return;
   }
 
+  const renderKey = JSON.stringify(
+    Array.isArray(shares)
+      ? shares.map((share) => [
+          share?.sharer_id || "",
+          share?.display_name || "",
+          share?.filename || "",
+          Number(share?.size_bytes || 0),
+          Boolean(share?.has_passcode),
+        ])
+      : [],
+  );
+  if (renderKey === lastSharesRenderKey) {
+    refreshSharesInFlight = false;
+    return;
+  }
+
+  lastSharesRenderKey = renderKey;
+  sharesList.innerHTML = "";
+  if (!shares.length) {
+    setSharesEmptyState("No active sharers right now.");
+    refreshSharesInFlight = false;
+    return;
+  }
+
+  const fragment = document.createDocumentFragment();
   shares.forEach((share) => {
     const li = document.createElement("li");
     const main = document.createElement("div");
@@ -1431,7 +1519,7 @@ async function refreshShares() {
         return;
       }
       btn.disabled = true;
-      btn.textContent = "Receiving…";
+      btn.textContent = "Receiving...";
       receiveInProgress = true;
       showReceiveOverlay(share.filename);
       startReceiveHealthPing();
@@ -1460,7 +1548,7 @@ async function refreshShares() {
         const onDl = (ratio, loaded, total) => {
           if (ratio < 0) {
             receiveProgressBar.classList.add("indeterminate");
-            receiveOverlayStatus.textContent = `Downloaded ${formatBytes(loaded)}…`;
+            receiveOverlayStatus.textContent = `Downloaded ${formatBytes(loaded)}...`;
             return;
           }
           receiveProgressBar.classList.remove("indeterminate");
@@ -1479,10 +1567,10 @@ async function refreshShares() {
           return;
         }
 
-        receiveOverlayStatus.textContent = "Saving to your device…";
+        receiveOverlayStatus.textContent = "Saving to your device...";
         receiveProgressFill.style.width = "100%";
         saveBlob(share.filename, blob);
-        receiveOverlayStatus.textContent = "Done — check your downloads folder.";
+        receiveOverlayStatus.textContent = "Done - check your downloads folder.";
         await new Promise((r) => setTimeout(r, 600));
       } catch (err) {
         reportClientLog("ERROR", "Receive operation failed in the client.", {
@@ -1502,8 +1590,10 @@ async function refreshShares() {
 
     li.appendChild(main);
     li.appendChild(btn);
-    sharesList.appendChild(li);
+    fragment.appendChild(li);
   });
+  sharesList.appendChild(fragment);
+  refreshSharesInFlight = false;
 }
 
 shareForm.addEventListener("submit", async (e) => {
@@ -1536,7 +1626,10 @@ shareForm.addEventListener("submit", async (e) => {
   );
 
   try {
-    const settingsRes = await fetch("/api/settings");
+    const settingsRes = await fetchWithTimeout("/api/settings", { method: "GET" }, DOWNLOAD_TIMEOUT_MS);
+    if (!settingsRes.ok) {
+      throw await parseResponseError(settingsRes, "Unable to load server settings.");
+    }
     const settings = await settingsRes.json();
 
     if (settings.smb_active) {
@@ -1552,9 +1645,10 @@ shareForm.addEventListener("submit", async (e) => {
         uploadProgressText.textContent = `Uploaded ${formatBytes(loaded)} / ${formatBytes(total)} (${pct}%)`;
       });
       localSharerId = data.sharer_id;
+      updateServerEndpoint(resolveServerUrl(data));
     } else {
       uploadProgressText.textContent = "Measuring upload speed…";
-      const { sharer_id } = await uploadFileInChunks(
+      const shareResult = await uploadFileInChunks(
         file,
         displayName,
         passcode,
@@ -1567,7 +1661,8 @@ shareForm.addEventListener("submit", async (e) => {
         getChunkMb(),
         getThreads(),
       );
-      localSharerId = sharer_id;
+      localSharerId = shareResult.sharer_id;
+      updateServerEndpoint(resolveServerUrl(shareResult));
     }
 
     uploadProgressBar.classList.add("indeterminate");
@@ -1637,7 +1732,6 @@ async function initApp() {
   resetShareUi();
   await loadClientSettings();
   setupTheme();
-  setupInstallPrompt();
   registerServiceWorker();
   await loadSettingsPanel();
   configureSharePolling();

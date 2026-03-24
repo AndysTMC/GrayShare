@@ -9,7 +9,7 @@ GrayShare is a Windows desktop shell around a FastAPI app.
 Main files:
 
 - `desktop_app.py`
-  Desktop launcher, splash screen, child backend process startup, LAN advertisement, native save bridge, graceful shutdown.
+  Desktop launcher, splash screen, child backend process startup, Edge/WebView2-backed pywebview launch, LAN advertisement, native save bridge, graceful shutdown.
 - `main.py`
   FastAPI app, storage backends, share/session state, transfer endpoints, settings/config APIs, runtime logging.
 - `templates/index.html`
@@ -120,6 +120,8 @@ There are three receive paths:
 - mobile / plain browsers
   native browser download via `GET /api/receive/{id}/download`
 
+Browser download responses should preserve HTTP `Range` support (`206` / `416` behavior) so resume and seek-friendly downloads keep working.
+
 If receive behavior changes, verify all three.
 
 ## Storage Modes
@@ -143,6 +145,8 @@ Install-related assets:
 Keep manifest and service-worker routes rooted at `/`, not under `/static`.
 
 Desktop pywebview should not depend on the PWA path to function.
+
+The UI no longer exposes an install-app button. If installability changes, do not reintroduce a visible install control unless the product requirement changes.
 
 ## Build Workflow
 

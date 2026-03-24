@@ -26,7 +26,7 @@ from fastapi import (
     Request,
     UploadFile,
 )
-from fastapi.responses import FileResponse, HTMLResponse, Response, StreamingResponse
+from fastapi.responses import HTMLResponse, Response, StreamingResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, Field
@@ -64,6 +64,7 @@ STREAM_CHUNK_BYTES = int(os.getenv("FILE_STREAM_CHUNK_BYTES", str(1024 * 1024)))
 CHUNK_MIN_BYTES = int(os.getenv("CHUNK_MIN_BYTES", str(256 * 1024)))  # 256 KiB
 CHUNK_MAX_BYTES = int(os.getenv("CHUNK_MAX_BYTES", str(256 * 1024 * 1024)))  # 256 MiB
 SHARE_SESSION_STALE_SECONDS = int(os.getenv("SHARE_SESSION_STALE_SECONDS", "15"))
+PENDING_UPLOAD_STALE_SECONDS = int(os.getenv("PENDING_UPLOAD_STALE_SECONDS", "1800"))
 
 ACTIVITY_MAX = 100
 activity_log: deque = deque(maxlen=ACTIVITY_MAX)
@@ -441,6 +442,8 @@ class PendingChunkedUpload:
     parts_dir: Path
     received: Set[int] = field(default_factory=set)
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    updated_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
 
 class StorageBackend:
@@ -797,6 +800,14 @@ def _is_share_session_stale(
     return (current - session.last_seen_at).total_seconds() > SHARE_SESSION_STALE_SECONDS
 
 
+def _is_pending_upload_stale(
+    pending: PendingChunkedUpload,
+    now: datetime | None = None,
+) -> bool:
+    current = now or datetime.now(timezone.utc)
+    return (current - pending.updated_at).total_seconds() > PENDING_UPLOAD_STALE_SECONDS
+
+
 async def _remove_share_session(
     sharer_id: str,
     *,
@@ -849,31 +860,146 @@ async def _prune_stale_share_sessions() -> None:
         await _remove_share_session(sharer_id, reason="stale", missing_ok=True)
 
 
-def _build_receive_response(session: ShareSession):
-    if not isinstance(storage, SMBStorage):
-        path = _resolved_path_under_inbox(session.storage_uri)
-        return FileResponse(
-            path=path,
-            filename=session.filename,
-            media_type=session.content_type or "application/octet-stream",
+async def _prune_stale_pending_uploads() -> None:
+    now = datetime.now(timezone.utc)
+    stale_items = [
+        (sharer_id, pending)
+        for sharer_id, pending in list(pending_chunked.items())
+        if _is_pending_upload_stale(pending, now)
+    ]
+    for sharer_id, pending in stale_items:
+        pending_chunked.pop(sharer_id, None)
+        await asyncio.to_thread(shutil.rmtree, pending.parts_dir, True)
+        log_backend_event(
+            "WARN",
+            "transfer",
+            "Discarded stale pending chunk upload.",
+            meta={
+                "sharer_id": sharer_id,
+                "filename": pending.filename,
+                "received_chunks": len(pending.received),
+                "total_chunks": pending.total_chunks,
+            },
         )
 
+
+def _parse_byte_range(range_header: str | None, size: int) -> tuple[int, int] | None:
+    if not range_header:
+        return None
+    value = str(range_header).strip()
+    if not value:
+        return None
+    if not value.lower().startswith("bytes="):
+        raise HTTPException(
+            status_code=416,
+            detail="Invalid Range header.",
+            headers={"Content-Range": f"bytes */{size}"},
+        )
+    spec = value[6:].strip()
+    if "," in spec:
+        raise HTTPException(
+            status_code=416,
+            detail="Multiple ranges are not supported.",
+            headers={"Content-Range": f"bytes */{size}"},
+        )
+    if "-" not in spec:
+        raise HTTPException(
+            status_code=416,
+            detail="Invalid Range header.",
+            headers={"Content-Range": f"bytes */{size}"},
+        )
+
+    start_text, end_text = spec.split("-", 1)
+    start_text = start_text.strip()
+    end_text = end_text.strip()
+
+    if size < 0:
+        size = 0
+    if size == 0:
+        raise HTTPException(
+            status_code=416,
+            detail="Requested range is not satisfiable.",
+            headers={"Content-Range": "bytes */0"},
+        )
+
+    if not start_text:
+        try:
+            suffix_length = int(end_text)
+        except Exception as exc:
+            raise HTTPException(
+                status_code=416,
+                detail="Invalid Range header.",
+                headers={"Content-Range": f"bytes */{size}"},
+            ) from exc
+        if suffix_length <= 0:
+            raise HTTPException(
+                status_code=416,
+                detail="Requested range is not satisfiable.",
+                headers={"Content-Range": f"bytes */{size}"},
+            )
+        if suffix_length >= size:
+            return 0, size - 1
+        return size - suffix_length, size - 1
+
+    try:
+        start = int(start_text)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=416,
+            detail="Invalid Range header.",
+            headers={"Content-Range": f"bytes */{size}"},
+        ) from exc
+
+    if end_text:
+        try:
+            end = int(end_text)
+        except Exception as exc:
+            raise HTTPException(
+                status_code=416,
+                detail="Invalid Range header.",
+                headers={"Content-Range": f"bytes */{size}"},
+            ) from exc
+    else:
+        end = size - 1
+
+    if start < 0 or end < start or start >= size:
+        raise HTTPException(
+            status_code=416,
+            detail="Requested range is not satisfiable.",
+            headers={"Content-Range": f"bytes */{size}"},
+        )
+
+    return start, min(end, size - 1)
+
+
+def _build_receive_response(session: ShareSession, request: Request):
+    total_size = max(0, int(session.size_bytes or 0))
+    media_type = session.content_type or "application/octet-stream"
     headers = {
+        "Accept-Ranges": "bytes",
         "Content-Disposition": f'attachment; filename="{session.filename}"',
     }
-    if session.size_bytes == 0:
-        headers["Content-Length"] = "0"
-        return Response(
-            content=b"",
-            media_type=session.content_type or "application/octet-stream",
+    range_spec = _parse_byte_range(request.headers.get("range"), total_size)
+
+    if range_spec is None:
+        if total_size == 0:
+            headers["Content-Length"] = "0"
+            return Response(content=b"", media_type=media_type, headers=headers)
+        headers["Content-Length"] = str(total_size)
+        return StreamingResponse(
+            _range_iterator_for_session(session, 0, total_size),
+            media_type=media_type,
             headers=headers,
         )
-    if session.size_bytes > 0:
-        headers["Content-Length"] = str(session.size_bytes)
 
+    start, end = range_spec
+    length = end - start + 1
+    headers["Content-Range"] = f"bytes {start}-{end}/{total_size}"
+    headers["Content-Length"] = str(length)
     return StreamingResponse(
-        file_byte_iterator(session.storage_uri, STREAM_CHUNK_BYTES),
-        media_type=session.content_type or "application/octet-stream",
+        _range_iterator_for_session(session, start, length),
+        status_code=206,
+        media_type=media_type,
         headers=headers,
     )
 
@@ -898,6 +1024,19 @@ def _detect_local_ip() -> str:
     except Exception:
         pass
     return "127.0.0.1"
+
+
+def _current_network_info() -> NetworkInfo:
+    port = runtime_current_port or int(os.getenv("APP_PORT", "8000"))
+    ip = runtime_host_ip or _detect_local_ip()
+    scheme = os.getenv("APP_SCHEME", "http").lower().strip() or "http"
+    endpoint = f"{ip}:{port}"
+    return NetworkInfo(
+        ip=ip,
+        port=port,
+        endpoint=endpoint,
+        url=f"{scheme}://{endpoint}/",
+    )
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -925,6 +1064,7 @@ async def service_worker():
 @app.get("/api/shares", response_model=List[SharingUser])
 async def list_shares():
     await _prune_stale_share_sessions()
+    await _prune_stale_pending_uploads()
     return [
         SharingUser(
             sharer_id=session.sharer_id,
@@ -1098,15 +1238,7 @@ async def health():
 
 @app.get("/api/network/info", response_model=NetworkInfo)
 async def network_info():
-    port = runtime_current_port or int(os.getenv("APP_PORT", "8000"))
-    ip = runtime_host_ip or await asyncio.to_thread(_detect_local_ip)
-    scheme = os.getenv("APP_SCHEME", "http").lower().strip() or "http"
-    return NetworkInfo(
-        ip=ip,
-        port=port,
-        endpoint=f"{ip}:{port}",
-        url=f"{scheme}://{ip}:{port}/",
-    )
+    return await asyncio.to_thread(_current_network_info)
 
 
 @app.post("/api/telemetry/upload-probe")
@@ -1138,6 +1270,7 @@ async def client_log(payload: FrontendLogPayload):
 @app.post("/api/share/init")
 async def share_init(body: ShareInitBody):
     """Start a parallel chunked upload (local storage only)."""
+    await _prune_stale_pending_uploads()
     if isinstance(storage, SMBStorage):
         raise HTTPException(
             status_code=501,
@@ -1188,13 +1321,20 @@ async def share_init(body: ShareInitBody):
             "total_chunks": total_chunks,
         },
     )
-    return {"sharer_id": sharer_id, "total_chunks": total_chunks}
+    network = await asyncio.to_thread(_current_network_info)
+    return {
+        "sharer_id": sharer_id,
+        "total_chunks": total_chunks,
+        "url": network.url,
+        "endpoint": network.endpoint,
+    }
 
 
 @app.post("/api/share/{sharer_id}/finalize")
 async def share_finalize(sharer_id: str):
     """Client calls this after all chunks are uploaded to trigger the merge.
     Returns the completed ShareSession."""
+    await _prune_stale_pending_uploads()
     pending = pending_chunked.get(sharer_id)
     if not pending:
         raise HTTPException(status_code=404, detail="Pending upload not found.")
@@ -1223,7 +1363,13 @@ async def share_finalize(sharer_id: str):
             "chunk_size": session.transfer_chunk_size,
         },
     )
-    return {"sharer_id": session.sharer_id, "filename": session.filename}
+    network = await asyncio.to_thread(_current_network_info)
+    return {
+        "sharer_id": session.sharer_id,
+        "filename": session.filename,
+        "url": network.url,
+        "endpoint": network.endpoint,
+    }
 
 
 @app.post("/api/share/{sharer_id}/chunk")
@@ -1276,6 +1422,7 @@ async def share_upload_chunk(
                 detail=f"Chunk size mismatch: expected {expected} bytes, got {size}.",
             )
         pending.received.add(chunk_index)
+        pending.updated_at = datetime.now(timezone.utc)
 
     return {"ok": True, "chunk_index": chunk_index, "complete": False}
 
@@ -1406,7 +1553,13 @@ async def start_share(
             "size_bytes": session.size_bytes,
         },
     )
-    return {"sharer_id": sharer_id, "status": "sharing"}
+    network = await asyncio.to_thread(_current_network_info)
+    return {
+        "sharer_id": sharer_id,
+        "status": "sharing",
+        "url": network.url,
+        "endpoint": network.endpoint,
+    }
 
 
 @app.post("/api/share/{sharer_id}/stop")
@@ -1426,7 +1579,11 @@ async def share_heartbeat(sharer_id: str):
 
 
 @app.post("/api/receive/{sharer_id}")
-async def receive_file(sharer_id: str, passcode: Optional[str] = Form(default=None)):
+async def receive_file(
+    sharer_id: str,
+    request: Request,
+    passcode: Optional[str] = Form(default=None),
+):
     await _prune_stale_share_sessions()
     session = _get_active_session(sharer_id, passcode)
     log_backend_event(
@@ -1446,12 +1603,13 @@ async def receive_file(sharer_id: str, passcode: Optional[str] = Form(default=No
         },
     )
 
-    return _build_receive_response(session)
+    return _build_receive_response(session, request)
 
 
 @app.get("/api/receive/{sharer_id}/download")
 async def receive_file_download(
     sharer_id: str,
+    request: Request,
     passcode: Optional[str] = Query(default=None),
 ):
     await _prune_stale_share_sessions()
@@ -1472,7 +1630,7 @@ async def receive_file_download(
             "mode": "browser-native",
         },
     )
-    return _build_receive_response(session)
+    return _build_receive_response(session, request)
 
 
 @app.post("/api/receive/{sharer_id}/save-local", response_model=LocalSaveResult)

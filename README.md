@@ -11,12 +11,14 @@ GrayShare is a Windows LAN file-sharing app with a packaged desktop executable a
 - share files from one device to others on the LAN
 - show a QR code for quick mobile access
 - support optional passcodes
+- support HTTP Range requests on browser downloads for resume/seek-friendly transfers
 - save desktop data under `%USERPROFILE%\.grayshare`
 - build both a portable exe and an NSIS installer
 
 ## How It Works
 
 - `GrayShare.exe` opens a pywebview desktop window
+- Windows desktop launches pywebview with the Edge/WebView2 backend by default
 - the desktop app starts the FastAPI backend as a separate child process
 - the desktop UI uses loopback (`127.0.0.1`)
 - phones and other devices use the LAN URL shown in the app
@@ -83,11 +85,11 @@ GrayShare currently uses three receive flows:
 - browsers with File System Access API
   browser-selected save handle
 - mobile / plain browsers
-  native browser download via `GET /api/receive/{id}/download`
+  native browser download via `GET /api/receive/{id}/download` with HTTP Range support
 
 ## PWA
 
-Browser clients include a manifest and service worker for install support.
+Browser clients still include a manifest and service worker, but the UI no longer shows an in-app install button.
 
 Important limitation:
 

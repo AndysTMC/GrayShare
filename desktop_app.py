@@ -875,6 +875,10 @@ def main():
     upnp = None
     cleanup_lock = threading.Lock()
     cleanup_done = False
+    preferred_gui = None
+    if os.name == "nt":
+        gui_override = os.getenv("GRAYSHARE_WEBVIEW_GUI", "edgechromium").strip().lower()
+        preferred_gui = None if gui_override in {"", "default", "auto"} else gui_override
 
     def cleanup_server_artifacts(
         current_server: EmbeddedServer | None,
@@ -1073,9 +1077,14 @@ def main():
 
         atexit.register(cleanup)
         append_startup_log(log_file, "Opening splash window while GrayShare boots.")
+        append_startup_log(
+            log_file,
+            f"Starting pywebview with gui={preferred_gui or 'default'} private_mode=False storage_path={data_dir / 'webview'}",
+        )
         webview.start(
             start_bootstrap,
             (window,),
+            gui=preferred_gui,
             debug=False,
             private_mode=False,
             storage_path=str(data_dir / "webview"),
