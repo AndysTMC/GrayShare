@@ -352,6 +352,19 @@ def configure_runtime_control(
     )
 
 
+# Only these names are runtime data. Never rmtree unknown siblings — a Linux
+# install used to collocate the git checkout at APP_DATA_DIR/app.
+_CLEARABLE_DATA_NAMES = frozenset(
+    {
+        "inbox",
+        "history.jsonl",
+        "startup.log",
+        "backend.log",
+        ".clear_webview",
+    }
+)
+
+
 def _clear_app_data_sync() -> tuple[int, int, List[str]]:
     deleted_items = 0
     preserved_items = 0
@@ -367,6 +380,9 @@ def _clear_app_data_sync() -> tuple[int, int, List[str]]:
     for path in list(APP_DATA_DIR.iterdir()):
         if path.resolve() in preserve:
             preserved_items += 1
+            continue
+        if path.name not in _CLEARABLE_DATA_NAMES:
+            skipped.append(f"{path.name}: not runtime data (left in place)")
             continue
         try:
             if path.is_dir():
@@ -683,17 +699,28 @@ append_backend_log(
 )
 
 
-@app.middleware("http")
-async def log_unhandled_request_errors(request: Request, call_next):
-    try:
-        return await call_next(request)
-    except Exception:
-        append_backend_log(
-            f"Unhandled request error for {request.method} {request.url.path}\n"
-            f"{traceback.format_exc().rstrip()}",
-            level="ERROR",
-        )
-        raise
+class LogUnhandledASGI:
+    """Pure ASGI wrapper. Starlette BaseHTTPMiddleware breaks SSE on Ctrl-C."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        try:
+            await self.app(scope, receive, send)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            if scope.get("type") == "http":
+                append_backend_log(
+                    f"Unhandled request error for {scope.get('method', '')} {scope.get('path', '')}\n"
+                    f"{traceback.format_exc().rstrip()}",
+                    level="ERROR",
+                )
+            raise
+
+
+app.add_middleware(LogUnhandledASGI)
 
 
 def _chunk_spec(session: ShareSession) -> Tuple[int, int]:
@@ -770,6 +797,19 @@ def _preallocate_file_sync(path: Path, size: int) -> None:
     with path.open("wb") as f:
         if size > 0:
             f.truncate(size)
+
+
+def _ensure_inbox_capacity(size: int) -> None:
+    if size > 8 * 1024 * 1024 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="File is too large.")
+    try:
+        free = shutil.disk_usage(INBOX_DIR).free
+        if size > free:
+            raise HTTPException(status_code=507, detail="Not enough disk space for this file.")
+    except HTTPException:
+        raise
+    except Exception:
+        pass
 
 
 async def _finalize_chunked_upload(pending: PendingChunkedUpload) -> ShareSession:
@@ -871,6 +911,14 @@ def _is_loopback_request(request: Request) -> bool:
         return False
 
 
+def _access_key_matches(provided: str, expected: str) -> bool:
+    left = str(provided or "")
+    right = str(expected or "")
+    if len(left) != len(right):
+        return False
+    return secrets.compare_digest(left, right)
+
+
 def _is_authorized_request(request: Request, k: str = "") -> bool:
     """Loopback clients are trusted; LAN clients must present the access key.
 
@@ -878,7 +926,12 @@ def _is_authorized_request(request: Request, k: str = "") -> bool:
     """
     if _is_loopback_request(request):
         return True
-    return secrets.compare_digest(str(k or ""), ACCESS_KEY)
+    return _access_key_matches(k, ACCESS_KEY)
+
+
+def _require_authorized(request: Request, k: str = "") -> None:
+    if not _is_authorized_request(request, k):
+        raise HTTPException(status_code=403, detail="Invalid or missing access key.")
 
 
 def _redact_network_info(info: NetworkInfo) -> NetworkInfo:
@@ -1164,22 +1217,128 @@ def _build_receive_response(session: ShareSession, request: Request):
     )
 
 
+_SKIP_IFACE_PREFIXES = (
+    "lo",
+    "docker",
+    "br-",
+    "veth",
+    "virbr",
+    "tun",
+    "tap",
+    "wg",
+    "tailscale",
+    "cni",
+    "flannel",
+    "vboxnet",
+    "vmnet",
+    "zt",
+)
+
+
+def _skip_netif(name: str) -> bool:
+    n = (name or "").lower()
+    if n == "lo":
+        return True
+    return any(n.startswith(p) for p in _SKIP_IFACE_PREFIXES)
+
+
+def _lan_ip_score(ip: str, iface: str = "") -> int:
+    if iface and _skip_netif(iface):
+        return -1
+    if not ip or ip.startswith("127.") or ip.startswith("169.254."):
+        return -1
+    if ip.startswith("172.17."):
+        return -1
+    if ip.startswith("192.168."):
+        return 300
+    if ip.startswith("10."):
+        return 200
+    parts = ip.split(".")
+    try:
+        b0, b1 = int(parts[0]), int(parts[1])
+    except Exception:
+        return -1
+    if b0 == 172 and 16 <= b1 <= 31:
+        return 80
+    return 40
+
+
+def _ipv4_on_iface(name: str) -> str | None:
+    if not sys.platform.startswith("linux"):
+        return None
+    try:
+        import fcntl
+        import struct
+
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            packed = struct.pack("256s", name[:15].encode("utf-8"))
+            buf = fcntl.ioctl(sock.fileno(), 0x8915, packed)
+            return socket.inet_ntoa(buf[20:24])
+        finally:
+            sock.close()
+    except Exception:
+        return None
+
+
+def _default_route_ifaces() -> list[str]:
+    rows: list[tuple[int, str]] = []
+    try:
+        with open("/proc/net/route", encoding="utf-8") as fh:
+            next(fh, None)
+            for line in fh:
+                parts = line.split()
+                if len(parts) < 8:
+                    continue
+                iface, dest, _gw, flags, _ref, _use, metric, mask = parts[:8]
+                if dest != "00000000" or mask != "00000000":
+                    continue
+                if int(flags, 16) & 0x1 == 0:
+                    continue
+                rows.append((int(metric), iface))
+    except Exception:
+        return []
+    rows.sort()
+    return [name for _metric, name in rows]
+
+
 def _detect_local_ip() -> str:
-    env_ip = os.getenv("APP_HOST_IP")
+    env_ip = os.getenv("APP_HOST_IP", "").strip()
     if env_ip:
         return env_ip
+    ranked: list[tuple[int, str]] = []
+    for iface in _default_route_ifaces():
+        ip = _ipv4_on_iface(iface)
+        if not ip:
+            continue
+        score = _lan_ip_score(ip, iface)
+        if score > 0:
+            ranked.append((score + 50, ip))
+    try:
+        for name in os.listdir("/sys/class/net"):
+            ip = _ipv4_on_iface(name)
+            if not ip:
+                continue
+            score = _lan_ip_score(ip, name)
+            if score > 0:
+                ranked.append((score, ip))
+    except Exception:
+        pass
+    if ranked:
+        ranked.sort(reverse=True)
+        return ranked[0][1]
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
             s.connect(("8.8.8.8", 80))
             ip = s.getsockname()[0]
-            if ip and not ip.startswith("127."):
+            if _lan_ip_score(ip, "") > 0:
                 return ip
     except Exception:
         pass
     try:
         host = socket.gethostname()
         ip = socket.gethostbyname(host)
-        if ip:
+        if ip and _lan_ip_score(ip, "") > 0:
             return ip
     except Exception:
         pass
@@ -1187,7 +1346,7 @@ def _detect_local_ip() -> str:
 
 
 def _current_network_info() -> NetworkInfo:
-    port = runtime_current_port or int(os.getenv("APP_PORT", "8000"))
+    port = runtime_current_port or int(os.getenv("APP_PORT", "4567"))
     ip = runtime_host_ip or _detect_local_ip()
     scheme = os.getenv("APP_SCHEME", "http").lower().strip() or "http"
     endpoint = f"{ip}:{port}"
@@ -1230,7 +1389,7 @@ async def sse_events(request: Request, k: str = Query(default="")):
     Gated by the same access key as /api/shares — event payloads carry
     filenames and sharer names.
     """
-    if not secrets.compare_digest(str(k or ""), ACCESS_KEY):
+    if not _access_key_matches(k, ACCESS_KEY):
         raise HTTPException(status_code=403, detail="Invalid or missing access key.")
     return StreamingResponse(
         event_stream(request),
@@ -1249,7 +1408,7 @@ async def list_shares(k: str = Query(default="")):
     await _prune_stale_pending_uploads()
     # Share metadata (names, filenames, sizes) is only revealed to clients that
     # present the access key distributed via the QR code / network URL.
-    if not secrets.compare_digest(str(k or ""), ACCESS_KEY):
+    if not _access_key_matches(k, ACCESS_KEY):
         raise HTTPException(status_code=403, detail="Invalid or missing access key.")
     return [
         SharingUser(
@@ -1486,8 +1645,9 @@ async def client_log(payload: FrontendLogPayload):
 
 
 @app.post("/api/share/init")
-async def share_init(body: ShareInitBody):
+async def share_init(body: ShareInitBody, request: Request, k: str = Query(default="")):
     """Start a parallel chunked upload (local storage only)."""
+    _require_authorized(request, k)
     await _prune_stale_pending_uploads()
     if isinstance(storage, SMBStorage):
         raise HTTPException(
@@ -1512,6 +1672,7 @@ async def share_init(body: ShareInitBody):
     sharer_id = secrets.token_urlsafe(10)
     file_token = secrets.token_urlsafe(12)
     target_path = INBOX_DIR / f"{file_token}_{safe_name}"
+    _ensure_inbox_capacity(body.total_size)
     await asyncio.to_thread(_preallocate_file_sync, target_path, body.total_size)
     pending = PendingChunkedUpload(
         sharer_id=sharer_id,
@@ -1549,9 +1710,10 @@ async def share_init(body: ShareInitBody):
 
 
 @app.post("/api/share/{sharer_id}/finalize")
-async def share_finalize(sharer_id: str):
+async def share_finalize(sharer_id: str, request: Request, k: str = Query(default="")):
     """Client calls this after all chunks are uploaded to trigger the merge.
     Returns the completed ShareSession."""
+    _require_authorized(request, k)
     await _prune_stale_pending_uploads()
     pending = pending_chunked.get(sharer_id)
     if not pending:
@@ -1593,9 +1755,12 @@ async def share_finalize(sharer_id: str):
 @app.post("/api/share/{sharer_id}/chunk")
 async def share_upload_chunk(
     sharer_id: str,
+    request: Request,
     chunk_index: int = Form(...),
     file: UploadFile = File(...),
+    k: str = Query(default=""),
 ):
+    _require_authorized(request, k)
     pending = pending_chunked.get(sharer_id)
     if not pending:
         if sharer_id in share_sessions:
@@ -1735,10 +1900,13 @@ async def receive_chunk_get(
 
 @app.post("/api/share")
 async def start_share(
+    request: Request,
     display_name: str = Form(...),
     passcode: Optional[str] = Form(default=None),
     file: UploadFile = File(...),
+    k: str = Query(default=""),
 ):
+    _require_authorized(request, k)
     display_name = display_name.strip()
     if not display_name:
         raise HTTPException(status_code=400, detail="display_name is required.")
@@ -1788,14 +1956,20 @@ async def start_share(
 
 
 @app.post("/api/share/{sharer_id}/stop")
-async def stop_share(sharer_id: str):
+async def stop_share(sharer_id: str, request: Request, k: str = Query(default="")):
+    _require_authorized(request, k)
     log_backend_event("INFO", "transfer", "Manual stop requested for share.", meta={"sharer_id": sharer_id})
+    pending = pending_chunked.pop(sharer_id, None)
+    if pending:
+        await asyncio.to_thread(pending.target_path.unlink, missing_ok=True)
+        return {"status": "stopped", "deleted_file": True, "pending": True}
     _, deleted_file = await _remove_share_session(sharer_id, reason="manual")
     return {"status": "stopped", "deleted_file": deleted_file}
 
 
 @app.post("/api/share/{sharer_id}/heartbeat")
-async def share_heartbeat(sharer_id: str):
+async def share_heartbeat(sharer_id: str, request: Request, k: str = Query(default="")):
+    _require_authorized(request, k)
     session = share_sessions.get(sharer_id)
     if not session or not session.active:
         raise HTTPException(status_code=404, detail="Share session not found.")

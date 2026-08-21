@@ -18,12 +18,69 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.request import urlopen
 
+
+def strip_snap_library_paths(value: str) -> str:
+    """Drop /snap/... entries that make WebKitGTK load snap's libpthread."""
+    parts = []
+    for item in str(value or "").split(":"):
+        if not item:
+            continue
+        if "/snap/" in item or item.startswith("/snap"):
+            continue
+        parts.append(item)
+    return ":".join(parts)
+
+
+def sanitize_env_for_webkit() -> list[str]:
+    """Clear snap-leaked loader paths so WebKitNetworkProcess can start.
+
+    VS Code / Chromium snaps prepend /snap/core20/... to LD_LIBRARY_PATH.
+    WebKitGTK then loads snap libpthread and dies with
+    `undefined symbol: __libc_pthread_init, version GLIBC_PRIVATE`.
+
+    Must run BEFORE importing webview/GTK.
+    """
+    if not sys.platform.startswith("linux"):
+        return []
+    changed: list[str] = []
+    for key in (
+        "LD_LIBRARY_PATH",
+        "LD_PRELOAD",
+        "LD_AUDIT",
+        "GTK_PATH",
+        "GI_TYPELIB_PATH",
+        "WEBKIT_EXEC_PATH",
+        "SNAP_LIBRARY_PATH",
+        "GIO_MODULE_DIR",
+    ):
+        raw = os.environ.get(key)
+        if not raw:
+            continue
+        cleaned = strip_snap_library_paths(raw)
+        if cleaned == raw:
+            continue
+        if cleaned:
+            os.environ[key] = cleaned
+        else:
+            os.environ.pop(key, None)
+        changed.append(key)
+    return changed
+
+
+# WebKitGTK helper processes inherit this env at spawn. Importing webview/gi
+# too early freezes the polluted snap loader path into NetworkProcess.
+sanitize_env_for_webkit()
+
 import uvicorn
 
 try:
     import webview
 except Exception:
     webview = None
+else:
+    import logging as _logging
+
+    _logging.getLogger("pywebview").setLevel(_logging.CRITICAL)
 
 try:
     from zeroconf import ServiceInfo, Zeroconf
@@ -71,22 +128,227 @@ class PROCESSENTRY32W(ctypes.Structure):
     ]
 
 
+_SKIP_IFACE_PREFIXES = (
+    "lo",
+    "docker",
+    "br-",
+    "veth",
+    "virbr",
+    "tun",
+    "tap",
+    "wg",
+    "tailscale",
+    "cni",
+    "flannel",
+    "vboxnet",
+    "vmnet",
+    "zt",
+)
+
+
+def skip_netif(name: str) -> bool:
+    n = (name or "").lower()
+    if n == "lo":
+        return True
+    return any(n.startswith(p) for p in _SKIP_IFACE_PREFIXES)
+
+
+def lan_ip_score(ip: str, iface: str = "") -> int:
+    """Higher is a better QR/LAN address. Virtual/docker links score negative."""
+    if iface and skip_netif(iface):
+        return -1
+    if not ip or ip.startswith("127.") or ip.startswith("169.254."):
+        return -1
+    if ip.startswith("172.17."):
+        return -1
+    if ip.startswith("192.168."):
+        return 300
+    if ip.startswith("10."):
+        return 200
+    parts = ip.split(".")
+    try:
+        b0, b1 = int(parts[0]), int(parts[1])
+    except Exception:
+        return -1
+    if b0 == 172 and 16 <= b1 <= 31:
+        return 80
+    return 40
+
+
+def _ipv4_on_iface(name: str) -> str | None:
+    if not sys.platform.startswith("linux"):
+        return None
+    try:
+        import fcntl
+        import struct
+
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            packed = struct.pack("256s", name[:15].encode("utf-8"))
+            buf = fcntl.ioctl(sock.fileno(), 0x8915, packed)
+            return socket.inet_ntoa(buf[20:24])
+        finally:
+            sock.close()
+    except Exception:
+        return None
+
+
+def _default_route_ifaces() -> list[str]:
+    rows: list[tuple[int, str]] = []
+    try:
+        with open("/proc/net/route", encoding="utf-8") as fh:
+            next(fh, None)
+            for line in fh:
+                parts = line.split()
+                if len(parts) < 8:
+                    continue
+                iface, dest, _gw, flags, _ref, _use, metric, mask = parts[:8]
+                if dest != "00000000" or mask != "00000000":
+                    continue
+                if int(flags, 16) & 0x1 == 0:
+                    continue
+                rows.append((int(metric), iface))
+    except Exception:
+        return []
+    rows.sort()
+    return [name for _metric, name in rows]
+
+
 def detect_local_ip() -> str:
+    env_ip = os.getenv("APP_HOST_IP", "").strip()
+    if env_ip:
+        return env_ip
+    ranked: list[tuple[int, str]] = []
+    for iface in _default_route_ifaces():
+        ip = _ipv4_on_iface(iface)
+        if not ip:
+            continue
+        score = lan_ip_score(ip, iface)
+        if score > 0:
+            ranked.append((score + 50, ip))
+    try:
+        for name in os.listdir("/sys/class/net"):
+            ip = _ipv4_on_iface(name)
+            if not ip:
+                continue
+            score = lan_ip_score(ip, name)
+            if score > 0:
+                ranked.append((score, ip))
+    except Exception:
+        pass
+    if ranked:
+        ranked.sort(reverse=True)
+        return ranked[0][1]
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
             s.connect(("8.8.8.8", 80))
             ip = s.getsockname()[0]
-            if ip and not ip.startswith("127."):
+            if lan_ip_score(ip, "") > 0:
                 return ip
     except Exception:
         pass
     try:
         ip = socket.gethostbyname(socket.gethostname())
-        if ip:
+        if ip and lan_ip_score(ip, "") > 0:
             return ip
     except Exception:
         pass
     return "127.0.0.1"
+
+
+def build_backend_command(
+    *,
+    executable: str,
+    port: int,
+    host: str,
+    frozen: bool,
+    script_path: str | None,
+    cert_file: Path | None = None,
+    key_file: Path | None = None,
+) -> list[str]:
+    """argv for the API child. Frozen exes re-enter this file; source runs must pass it."""
+    cmd = [executable]
+    if not frozen:
+        if not script_path:
+            raise RuntimeError("Unfrozen backend launch requires desktop_app.py.")
+        cmd.append(script_path)
+    cmd.extend(
+        [
+            "--server-only",
+            "--port",
+            str(port),
+            "--server-host",
+            str(host),
+        ]
+    )
+    if cert_file:
+        cmd.extend(["--tls-cert", str(cert_file)])
+    if key_file:
+        cmd.extend(["--tls-key", str(key_file)])
+    return cmd
+
+
+def resolve_listen_port(explicit: int | None, data_dir: Path | None = None) -> int:
+    """Headless/default port: --port, else app_config.json, else 4567. Never 0/8000."""
+    try:
+        port = int(explicit or 0)
+    except Exception:
+        port = 0
+    if 1 <= port <= 65535:
+        return port
+    cfg = load_app_config(data_dir or app_data_dir())
+    try:
+        port = int(cfg.get("port") or 4567)
+    except Exception:
+        port = 4567
+    if 1 <= port <= 65535:
+        return port
+    return 4567
+
+
+def venv_pyvenv_cfg() -> Path | None:
+    if sys.prefix == sys.base_prefix:
+        return None
+    cfg = Path(sys.prefix) / "pyvenv.cfg"
+    return cfg if cfg.is_file() else None
+
+
+def enable_venv_system_site_packages() -> bool:
+    """Turn on system site-packages in this venv so apt python3-gi is importable.
+
+    Returns True if pyvenv.cfg changed (caller must re-exec Python).
+    """
+    cfg = venv_pyvenv_cfg()
+    if cfg is None:
+        return False
+    try:
+        text = cfg.read_text(encoding="utf-8")
+    except Exception:
+        return False
+    lines = text.splitlines(keepends=True)
+    changed = False
+    found = False
+    out: list[str] = []
+    for line in lines:
+        if line.lower().startswith("include-system-site-packages"):
+            found = True
+            if "true" in line.lower():
+                out.append(line)
+            else:
+                nl = "\n" if line.endswith("\n") else ""
+                out.append(f"include-system-site-packages = true{nl}")
+                changed = True
+        else:
+            out.append(line)
+    if not found:
+        if out and not out[-1].endswith("\n"):
+            out[-1] += "\n"
+        out.append("include-system-site-packages = true\n")
+        changed = True
+    if not changed:
+        return False
+    cfg.write_text("".join(out), encoding="utf-8")
+    return True
 
 
 def find_free_port() -> int:
@@ -382,18 +644,15 @@ class EmbeddedServer:
         env["APP_SCHEME"] = "https" if self.cert_file and self.key_file else "http"
         if self.log_file:
             env["GRAYSHARE_STARTUP_LOG"] = str(self.log_file)
-        cmd = [
-            sys.executable,
-            "--server-only",
-            "--port",
-            str(self.port),
-            "--server-host",
-            str(self.host),
-        ]
-        if self.cert_file:
-            cmd.extend(["--tls-cert", str(self.cert_file)])
-        if self.key_file:
-            cmd.extend(["--tls-key", str(self.key_file)])
+        cmd = build_backend_command(
+            executable=sys.executable,
+            port=self.port,
+            host=self.host,
+            frozen=bool(getattr(sys, "frozen", False)),
+            script_path=str(Path(__file__).resolve()),
+            cert_file=self.cert_file,
+            key_file=self.key_file,
+        )
         creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
         self.process = subprocess.Popen(
             cmd,
@@ -697,27 +956,40 @@ def run_server_only(args) -> int:
     backend_log_file = data_dir / "backend.log"
     cert_file = args.tls_cert or None
     key_file = args.tls_key or None
+    # Set APP_PORT before importing main — it snapshots the env at import time.
+    # Headless with no --port used to print :8000 while uvicorn bound port 0.
+    port = resolve_listen_port(args.port, data_dir)
+    if not is_port_available(port):
+        requested = port
+        port = find_free_port()
+        print(
+            f"Port {requested} is busy; using {port} for this run.\n"
+            f"Another GrayShare is probably still running. Stop it with Ctrl-C\n"
+            f"in that terminal, or:  fuser -k {requested}/tcp",
+            flush=True,
+        )
+    os.environ["APP_PORT"] = str(port)
+    if not os.getenv("APP_HOST_IP", "").strip():
+        os.environ["APP_HOST_IP"] = detect_local_ip()
     try:
         if log_file:
             append_startup_log(
                 backend_log_file,
-                f"Backend process booting on {args.server_host or '0.0.0.0'}:{int(args.port or 0)}.",
+                f"Backend process booting on {args.server_host or '0.0.0.0'}:{port}.",
             )
         from main import app as fastapi_app, ACCESS_KEY, _current_network_info
 
-        # Propagate the actual bound port so network info / QR URLs are right
-        # (main falls back to APP_PORT env, then a hardcoded default).
-        if int(args.port or 0) > 0:
-            os.environ["APP_PORT"] = str(int(args.port))
-        # Headless mode prints the LAN URL + access key so a user (or systemd
-        # journal) can see where to connect without the desktop UI.
+        # Only print to the terminal for a real headless run. The desktop child
+        # inherits stdout and would otherwise spam the GUI terminal.
         network = _current_network_info()
-        print(f"GrayShare server running at {network.url}", flush=True)
-        print(f"Access key: {ACCESS_KEY}", flush=True)
+        if not log_file:
+            print(f"GrayShare server running at {network.url}", flush=True)
+            print(f"Access key: {ACCESS_KEY}", flush=True)
+            print("Press Ctrl-C to stop (do not use Ctrl-Z).", flush=True)
         config = uvicorn.Config(
             fastapi_app,
             host=args.server_host or "0.0.0.0",
-            port=int(args.port or 0),
+            port=port,
             reload=False,
             log_level="warning",
             access_log=False,
@@ -727,8 +999,15 @@ def run_server_only(args) -> int:
         )
         server = uvicorn.Server(config)
         append_startup_log(backend_log_file, "Backend process entering uvicorn event loop.")
-        server.run()
+        try:
+            server.run()
+        except KeyboardInterrupt:
+            print("\nStopped.", flush=True)
+            return 0
         append_startup_log(backend_log_file, "Backend process exited uvicorn event loop.")
+        return 0
+    except KeyboardInterrupt:
+        print("\nStopped.", flush=True)
         return 0
     except Exception:
         append_startup_log(
@@ -896,10 +1175,69 @@ def purge_webview_service_workers(data_dir: Path, log_file: Path | None = None) 
                 )
 
 
+def linux_gi_unavailable_message() -> str:
+    """Explain python3-gi failures, including Homebrew Python vs apt."""
+    running = sys.executable
+    system_py = "/usr/bin/python3"
+    system_has_gi = False
+    if Path(system_py).is_file():
+        try:
+            system_has_gi = (
+                subprocess.run(
+                    [system_py, "-c", "import gi"],
+                    capture_output=True,
+                    timeout=8,
+                ).returncode
+                == 0
+            )
+        except Exception:
+            system_has_gi = False
+    lines = [
+        "GrayShare desktop mode cannot import GTK (python3-gi).",
+        f"This process is: {running}",
+        "",
+    ]
+    brewish = "linuxbrew" in running or "homebrew" in running.lower()
+    if system_has_gi and (brewish or Path(sys.base_prefix).resolve() != Path("/usr").resolve()):
+        venv = Path(sys.prefix)
+        req = Path(__file__).resolve().parent / "requirements.txt"
+        lines += [
+            "python3-gi IS installed for Ubuntu's /usr/bin/python3.",
+            "This venv was created with a different Python (often Homebrew 3.14),",
+            "which cannot load Ubuntu's GTK bindings — even with system-site-packages.",
+            "",
+            "Recreate the environment with system Python:",
+            f"  rm -rf {venv}",
+            f"  {system_py} -m venv --system-site-packages {venv}",
+            f"  {venv / 'bin' / 'python'} -m pip install -r {req}",
+            "",
+            "If this is an install.sh copy, it is simpler to reinstall:",
+            "  rm -rf ~/.local/lib/grayshare/app/.venv",
+            "  curl -fsSL https://raw.githubusercontent.com/AndysTMC/GrayShare/main/install.sh | bash",
+            "",
+        ]
+    else:
+        lines += [
+            "Install the system packages:",
+            "  sudo apt install python3-gi gir1.2-webkit2-4.1 libgtk-3-0 python3-venv",
+            "",
+        ]
+    lines += [
+        "Or skip the GUI:",
+        "  grayshare --headless --port 4567",
+    ]
+    return "\n".join(lines)
+
+
 def main():
     args = parse_args()
     if args.server_only:
-        raise SystemExit(run_server_only(args))
+        try:
+            raise SystemExit(run_server_only(args))
+        except KeyboardInterrupt:
+            print("\nStopped.", flush=True)
+            raise SystemExit(0)
+    stripped_env = sanitize_env_for_webkit()
     if webview is None:
         raise RuntimeError("pywebview is required. Install dependencies and run again.")
 
@@ -910,6 +1248,11 @@ def main():
         try:
             import gi  # noqa: F401
         except ImportError:
+            # apt python3-gi lives in system site-packages; a default venv
+            # hides it. Enable and re-exec once so desktop mode works.
+            if os.getenv("GRAYSHARE_GI_REEXEC") != "1" and enable_venv_system_site_packages():
+                os.environ["GRAYSHARE_GI_REEXEC"] = "1"
+                os.execv(sys.executable, [sys.executable, *sys.argv])
             missing.append("python3-gi")
         if not missing:
             try:
@@ -924,16 +1267,7 @@ def main():
                 except (ImportError, ValueError):
                     missing.append("gir1.2-webkit2-4.1 (or gir1.2-webkit2-4.0)")
         if missing:
-            message = (
-                "GrayShare desktop mode needs system webview libraries that are "
-                f"missing: {', '.join(missing)}.\n\n"
-                "Install them with:\n"
-                "  sudo apt install python3-gi gir1.2-webkit2-4.1 libgtk-3-0\n"
-                "(or the equivalent for your distribution)\n\n"
-                "Alternatively run GrayShare without a GUI:\n"
-                "  python desktop_app.py --server-only --port 4567"
-            )
-            print(message, file=sys.stderr)
+            print(linux_gi_unavailable_message(), file=sys.stderr)
             raise SystemExit(1)
 
     host_ip = detect_local_ip()
@@ -948,6 +1282,11 @@ def main():
     reset_runtime_log(log_file, "GrayShare desktop")
     reset_runtime_log(backend_log_file, "GrayShare backend")
     append_startup_log(log_file, "Launching GrayShare desktop app.")
+    if stripped_env:
+        append_startup_log(
+            log_file,
+            f"Stripped snap library paths from {', '.join(stripped_env)} so WebKitGTK can start.",
+        )
     append_startup_log(log_file, f"Desktop log file: {log_file}")
     append_startup_log(log_file, f"Backend log file: {backend_log_file}")
     terminated_count = terminate_stale_grayshare_processes(log_file=log_file)

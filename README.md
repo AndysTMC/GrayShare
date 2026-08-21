@@ -34,6 +34,8 @@ grayshare update                   # update to the latest version
 
 If `command not found`, add `~/.local/bin` to your PATH (`export PATH="$HOME/.local/bin:$PATH"` in `~/.bashrc`).
 
+Uninstall: `grayshare uninstall` (removes the program and command; your transfer data under the per-OS data dir is kept).
+
 Windows (PowerShell):
 
 ```powershell

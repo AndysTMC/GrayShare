@@ -275,3 +275,157 @@ def test_history_persists_and_loads(app_module):
 
 def test_access_key_present(app_module):
     assert isinstance(app_module.ACCESS_KEY, str) and len(app_module.ACCESS_KEY) >= 16
+
+
+def test_wrong_length_access_key_is_403(app_module):
+    from fastapi.testclient import TestClient
+
+    client = TestClient(app_module.app)
+    res = client.get("/api/shares", params={"k": "short"})
+    assert res.status_code == 403
+    res = client.get("/api/shares")
+    assert res.status_code == 403
+    res = client.get("/api/shares", params={"k": app_module.ACCESS_KEY})
+    assert res.status_code == 200
+
+
+def test_stop_discards_pending_upload(app_module):
+    from fastapi.testclient import TestClient
+
+    main = app_module
+    pending = _make_pending(main, 4096, 1024)
+    assert pending.target_path.is_file()
+    client = TestClient(main.app)
+    res = client.post(
+        f"/api/share/{pending.sharer_id}/stop",
+        params={"k": main.ACCESS_KEY},
+    )
+    assert res.status_code == 200
+    assert res.json().get("pending") is True
+    assert not pending.target_path.exists()
+    assert pending.sharer_id not in main.pending_chunked
+
+
+def test_clear_data_does_not_delete_unrelated_dirs(app_module):
+    main = app_module
+    decoy = main.APP_DATA_DIR / "app"
+    decoy.mkdir()
+    (decoy / "keep.txt").write_text("installer checkout", encoding="utf-8")
+    inbox_file = main.INBOX_DIR / "stale.bin"
+    inbox_file.write_bytes(b"x")
+    deleted, _preserved, skipped = main._clear_app_data_sync()
+    assert (decoy / "keep.txt").is_file()
+    assert any("app:" in item for item in skipped)
+    assert deleted >= 1
+    assert not inbox_file.exists()
+
+
+def test_share_init_lan_requires_access_key(app_module, monkeypatch):
+    from fastapi.testclient import TestClient
+
+    monkeypatch.setattr(app_module, "_is_loopback_request", lambda _request: False)
+    client = TestClient(app_module.app)
+    payload = {
+        "display_name": "UT",
+        "filename": "a.bin",
+        "content_type": "application/octet-stream",
+        "total_size": 1024,
+        "chunk_size": 256 * 1024,
+    }
+    res = client.post("/api/share/init", json=payload)
+    assert res.status_code == 403
+    res = client.post(
+        "/api/share/init",
+        json=payload,
+        params={"k": app_module.ACCESS_KEY},
+    )
+    assert res.status_code == 200
+
+
+def test_backend_launch_cmd_includes_script_when_unfrozen():
+    import desktop_app
+
+    cmd = desktop_app.build_backend_command(
+        executable="/usr/bin/python3",
+        port=4567,
+        host="0.0.0.0",
+        frozen=False,
+        script_path="/opt/grayshare/desktop_app.py",
+    )
+    assert cmd[:4] == [
+        "/usr/bin/python3",
+        "/opt/grayshare/desktop_app.py",
+        "--server-only",
+        "--port",
+    ]
+    frozen_cmd = desktop_app.build_backend_command(
+        executable="/opt/GrayShare.exe",
+        port=4567,
+        host="0.0.0.0",
+        frozen=True,
+        script_path="/opt/grayshare/desktop_app.py",
+    )
+    assert frozen_cmd[0] == "/opt/GrayShare.exe"
+    assert "--server-only" in frozen_cmd
+    assert "/opt/grayshare/desktop_app.py" not in frozen_cmd
+
+
+def test_resolve_listen_port_defaults_to_4567(tmp_path, monkeypatch):
+    import desktop_app
+
+    monkeypatch.setenv("APP_DATA_DIR", str(tmp_path))
+    assert desktop_app.resolve_listen_port(None, tmp_path) == 4567
+    assert desktop_app.resolve_listen_port(0, tmp_path) == 4567
+    assert desktop_app.resolve_listen_port(9001, tmp_path) == 9001
+    (tmp_path / "app_config.json").write_text('{"port": 7777}', encoding="utf-8")
+    assert desktop_app.resolve_listen_port(None, tmp_path) == 7777
+
+
+def test_enable_venv_system_site_packages(tmp_path, monkeypatch):
+    import desktop_app
+    import sys
+
+    cfg = tmp_path / "pyvenv.cfg"
+    cfg.write_text("home = /usr\ninclude-system-site-packages = false\n", encoding="utf-8")
+    monkeypatch.setattr(sys, "prefix", str(tmp_path))
+    monkeypatch.setattr(sys, "base_prefix", "/usr")
+    assert desktop_app.enable_venv_system_site_packages() is True
+    text = cfg.read_text(encoding="utf-8")
+    assert "include-system-site-packages = true" in text
+    assert desktop_app.enable_venv_system_site_packages() is False
+
+
+def test_lan_ip_prefers_home_wifi_over_docker_and_vm():
+    import desktop_app
+
+    assert desktop_app.skip_netif("docker0")
+    assert desktop_app.skip_netif("veth0abc")
+    assert desktop_app.skip_netif("br-1234")
+    assert not desktop_app.skip_netif("wlp2s0")
+    wifi = desktop_app.lan_ip_score("192.168.1.13", "wlp2s0")
+    vm = desktop_app.lan_ip_score("172.16.0.2", "br-internal")
+    docker = desktop_app.lan_ip_score("172.17.0.1", "docker0")
+    assert docker < 0
+    assert vm < 0 or wifi > vm
+    assert wifi > desktop_app.lan_ip_score("10.0.0.5", "eth0")
+    assert desktop_app.lan_ip_score("172.16.0.2", "eth0") < wifi
+
+
+def test_strip_snap_library_paths():
+    import desktop_app
+
+    raw = "/usr/lib:/snap/core20/current/lib/x86_64-linux-gnu:/usr/local/lib"
+    cleaned = desktop_app.strip_snap_library_paths(raw)
+    assert "/snap/" not in cleaned
+    assert "/usr/lib" in cleaned
+    assert desktop_app.strip_snap_library_paths("/snap/core20/current/lib") == ""
+
+
+def test_linux_gi_message_mentions_running_interpreter():
+    import desktop_app
+    import sys
+
+    msg = desktop_app.linux_gi_unavailable_message()
+    assert "python3-gi" in msg or "GTK" in msg
+    assert sys.executable in msg
+    assert "grayshare --headless" in msg

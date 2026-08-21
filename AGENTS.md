@@ -9,7 +9,7 @@
 - Dev (desktop): `python desktop_app.py`
 - Dev (API only): `python -m uvicorn main:app --reload`
 - Headless: `python desktop_app.py --server-only --port 4567`
-- Test (one file / full): `.venv/bin/python -m pytest tests/test_backend.py -v` (pytest is not in `requirements.txt`; install it in the venv)
+- Test (one file / full): `pip install -r requirements-dev.txt` then `.venv/bin/python -m pytest tests/test_backend.py -v`
 - Lint / format: none in-repo
 - Build Windows: `.\build_portable.ps1 -SkipInstall` (full installer: `.\build_portable.ps1`)
 - Build Linux/macOS: `./build.sh --skip-install` or `./build.sh --skip-install --server-only`

@@ -9,3 +9,5 @@ inbox/
 *.pyd
 *.log
 PLAN.md
+install-grayshare.sh
+install-grayshare.ps1

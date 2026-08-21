@@ -84,9 +84,10 @@ if (-not (Test-Path $VenvPy)) {
     $VenvPy = Join-Path $AppDir ".venv\Scripts\python.exe"
     if (-not (Test-Path $VenvPy)) { $VenvPy = Join-Path $AppDir ".venv/bin/python" }
 }
-& $VenvPy -m pip install --quiet --upgrade pip
+$env:PIP_DISABLE_PIP_VERSION_CHECK = "1"
+& $VenvPy -m pip install --quiet --no-cache-dir --upgrade pip
 if ($LASTEXITCODE -ne 0) { Die "pip upgrade failed." }
-& $VenvPy -m pip install --quiet -r requirements.txt
+& $VenvPy -m pip install --quiet --no-cache-dir -r requirements.txt
 if ($LASTEXITCODE -ne 0) { Die "dependency install failed." }
 Pop-Location
 
@@ -141,6 +142,25 @@ switch (`$args[0]) {
         & `$Py -m pip install --quiet -r requirements.txt
         Pop-Location
         Write-Host "GrayShare updated."
+        exit 0
+    }
+    'uninstall' {
+        Write-Host "This removes the GrayShare program files and the 'grayshare' command."
+        Write-Host "Transfer data is kept. To delete it too, remove:"
+        Write-Host "  $env:USERPROFILE\.grayshare"
+        `$answer = Read-Host "Continue? [y/N]"
+        if (`$answer -match '^(y|yes)$') {
+            Remove-Item -Force "$BinDir\grayshare.bat", "$BinDir\grayshare.ps1" -ErrorAction SilentlyContinue
+            Remove-Item -Recurse -Force $AppDir -ErrorAction SilentlyContinue
+            Remove-Item -Force $InstallRoot -ErrorAction SilentlyContinue
+            # Remove the bin dir from the user PATH if we added it.
+            `$userPath = [Environment]::GetEnvironmentVariable("Path", "User")
+            if (`$userPath -like "*$BinDir*") {
+                `$newPath = (`$userPath -split ';' | Where-Object { `$_ -ne "$BinDir" }) -join ';'
+                [Environment]::SetEnvironmentVariable("Path", `$newPath, "User")
+            }
+            Write-Host "GrayShare uninstalled."
+        } else { Write-Host "Cancelled." }
         exit 0
     }
     'version' { Set-Location `$App; git describe --tags --always; exit 0 }

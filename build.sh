@@ -21,7 +21,11 @@ PY="${PYTHON:-python3}"
 
 if [[ $SKIP_INSTALL -eq 0 ]]; then
   if [[ ! -d .venv ]]; then
-    "$PY" -m venv .venv
+    if [[ "$(uname -s)" == "Linux" ]]; then
+      "$PY" -m venv --system-site-packages .venv
+    else
+      "$PY" -m venv .venv
+    fi
   fi
   # shellcheck disable=SC1091
   source .venv/bin/activate

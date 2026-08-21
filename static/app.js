@@ -283,6 +283,14 @@ async function parseResponseError(res, fallbackMessage) {
   return { detail: fallbackMessage };
 }
 
+function withAccessKey(url) {
+  const key = typeof accessKey === "function" ? accessKey() : "";
+  if (!key) return url;
+  return url.includes("?")
+    ? `${url}&k=${encodeURIComponent(key)}`
+    : `${url}?k=${encodeURIComponent(key)}`;
+}
+
 async function fetchWithTimeout(url, options = {}, timeoutMs = DOWNLOAD_TIMEOUT_MS) {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), timeoutMs);
@@ -331,7 +339,7 @@ async function uploadFileInChunks(file, displayName, passcode, onChunkProgress, 
   const chunkBytes = manualChunkBytes > 0 ? manualChunkBytes * 1024 * 1024 : clampChunkBytes(speed);
   const workers = manualWorkers > 0 ? manualWorkers : computeParallelWorkers(chunkBytes);
 
-  const initRes = await fetch("/api/share/init", {
+  const initRes = await fetch(withAccessKey("/api/share/init"), {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
@@ -368,7 +376,7 @@ async function uploadFileInChunks(file, displayName, passcode, onChunkProgress, 
       fd.append("chunk_index", String(j));
       fd.append("file", file.slice(start, sliceEnd), "chunk.bin");
       try {
-        const res = await fetch(`/api/share/${sharer_id}/chunk`, {
+        const res = await fetch(withAccessKey(`/api/share/${sharer_id}/chunk`), {
           method: "POST",
           body: fd,
           signal,
@@ -398,15 +406,15 @@ async function uploadFileInChunks(file, displayName, passcode, onChunkProgress, 
     aborted = true;
     // Tell the server to discard the partial upload instead of waiting for
     // the stale timeout.
-    void fetch(`/api/share/${sharer_id}/stop`, { method: "POST" }).catch(() => {});
+    void fetch(withAccessKey(`/api/share/${sharer_id}/stop`), { method: "POST" }).catch(() => {});
     throw err;
   }
   if (signal?.aborted) {
-    void fetch(`/api/share/${sharer_id}/stop`, { method: "POST" }).catch(() => {});
+    void fetch(withAccessKey(`/api/share/${sharer_id}/stop`), { method: "POST" }).catch(() => {});
     throw new DOMException("Upload cancelled", "AbortError");
   }
   onChunkProgress?.(nChunks, nChunks, chunkBytes, workers);
-  const finalRes = await fetch(`/api/share/${sharer_id}/finalize`, {
+  const finalRes = await fetch(withAccessKey(`/api/share/${sharer_id}/finalize`), {
     method: "POST",
     signal,
   });
@@ -1045,11 +1053,19 @@ async function loadNetworkInfo() {
   }
   networkInfoInFlight = true;
   try {
-    const res = await fetchWithTimeout("/api/network/info", { method: "GET" }, HEALTH_PING_TIMEOUT_MS);
+    const res = await fetchWithTimeout(withAccessKey("/api/network/info"), { method: "GET" }, HEALTH_PING_TIMEOUT_MS);
     if (!res.ok) {
       throw new Error("failed");
     }
     const data = await res.json();
+    if (installAccessKey(data && data.access_key)) {
+      if (eventSource) {
+        try { eventSource.close(); } catch { }
+        eventSource = null;
+        sseConnected = false;
+      }
+      setupEventStream();
+    }
     updateServerEndpoint(resolveServerUrl(data));
   } catch {
     if (!serverEndpointUrl) {
@@ -1082,7 +1098,6 @@ function renderQr(url) {
 }
 
 function setupNetworkInfo() {
-  void loadNetworkInfo();
   if (networkRefreshTimerId) clearTimeout(networkRefreshTimerId);
   networkRefreshTimerId = setTimeout(async function runNetworkRefresh() {
     await loadNetworkInfo();
@@ -1126,7 +1141,7 @@ async function loadActivityList() {
   emptyEl.textContent = "No activity yet — share or receive a file on Transfer.";
   listEl.innerHTML = "";
   try {
-    const res = await fetch("/api/activity");
+    const res = await fetch(withAccessKey("/api/activity"));
     const entries = await res.json();
     if (!Array.isArray(entries) || entries.length === 0) {
       emptyEl.classList.remove("hidden");
@@ -1167,6 +1182,18 @@ async function loadSettingsPanel() {
   if (threadsInput) threadsInput.value = String(getThreads());
   if (isLoopbackOrigin()) {
     await loadDesktopConfig();
+    try {
+      const res = await fetchWithTimeout("/api/settings", { method: "GET" }, HEALTH_PING_TIMEOUT_MS);
+      if (res.ok) {
+        const s = await res.json();
+        const pathEl = document.getElementById("clear-data-path");
+        if (pathEl && s.app_data_path) {
+          pathEl.textContent = s.app_data_path;
+          window.__grayshareDataDir = s.app_data_path;
+        }
+      }
+    } catch {
+    }
   }
 }
 
@@ -1552,7 +1579,7 @@ function startShareHeartbeat() {
     shareHeartbeatInFlight = true;
     try {
       const res = await fetchWithTimeout(
-        `/api/share/${localSharerId}/heartbeat`,
+        withAccessKey(`/api/share/${localSharerId}/heartbeat`),
         { method: "POST" },
         HEALTH_PING_TIMEOUT_MS,
       );
@@ -1574,7 +1601,7 @@ function startShareHeartbeat() {
 }
 
 function stopShareBeacon(sharerId) {
-  const url = `/api/share/${sharerId}/stop`;
+  const url = withAccessKey(`/api/share/${sharerId}/stop`);
   try {
     if (navigator.sendBeacon) {
       const payload = new Blob([""], { type: "text/plain;charset=UTF-8" });
@@ -1640,8 +1667,9 @@ function showToast(message, kind = "error") {
 const clearDataBtn = document.getElementById("clear-data");
 if (clearDataBtn) {
   clearDataBtn.addEventListener("click", async () => {
+    const dataDir = window.__grayshareDataDir || "the app data folder";
     const confirmed = window.confirm(
-      "Clear stored files, logs, and transfer data from %USERPROFILE%/.grayshare? Your saved settings will be kept.",
+      `Clear stored files, logs, and transfer data from ${dataDir}? Your saved settings will be kept.`,
     );
     if (!confirmed) return;
 
@@ -1790,17 +1818,30 @@ function setSharesEmptyState(message) {
 /** Access key (?k=...) that scopes which shares this client may see. */
 const ACCESS_KEY_STORAGE = "grayshare.accessKey";
 
+function installAccessKey(k) {
+  const next = String(k || "").trim();
+  if (!next) return false;
+  if (next === accessKeyValue) return false;
+  accessKeyValue = next;
+  try {
+    window.localStorage.setItem(ACCESS_KEY_STORAGE, next);
+  } catch {
+  }
+  return true;
+}
+
 function captureAccessKey() {
   try {
     const url = new URL(window.location.href);
     const k = (url.searchParams.get("k") || "").trim();
     if (k) {
-      window.localStorage.setItem(ACCESS_KEY_STORAGE, k);
+      installAccessKey(k);
       url.searchParams.delete("k");
       window.history.replaceState(null, "", url.toString());
     }
   } catch {
   }
+  if (accessKeyValue) return accessKeyValue;
   try {
     return window.localStorage.getItem(ACCESS_KEY_STORAGE) || "";
   } catch {
@@ -2117,7 +2158,7 @@ shareForm.addEventListener("submit", async (e) => {
     const settings = await settingsRes.json();
 
     if (settings.smb_active) {
-      const data = await postFormWithUploadProgress("/api/share", body, (ratio, loaded, total) => {
+      const data = await postFormWithUploadProgress(withAccessKey("/api/share"), body, (ratio, loaded, total) => {
         if (ratio < 0) {
           uploadProgressBar.classList.add("indeterminate");
           uploadProgressText.textContent = `Uploaded ${formatBytes(loaded)}…`;
@@ -2215,7 +2256,7 @@ shareForm.addEventListener("submit", async (e) => {
 stopShareBtn.addEventListener("click", async () => {
   if (localSharerId) {
     try {
-      await fetch(`/api/share/${localSharerId}/stop`, { method: "POST" });
+      await fetch(withAccessKey(`/api/share/${localSharerId}/stop`), { method: "POST" });
     } catch {
     }
   }
@@ -2243,8 +2284,9 @@ async function initApp() {
   setupTheme();
   registerServiceWorker();
   await loadSettingsPanel();
-  configureSharePolling();
+  await loadNetworkInfo();
   setupNetworkInfo();
+  configureSharePolling();
   await refreshShares();
 }
 
