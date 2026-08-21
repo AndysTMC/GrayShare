@@ -2,6 +2,7 @@
 
 ## Commands
 
+- Run (Linux/macOS): `./grayshare.sh` (desktop) or `./grayshare.sh --headless --port 4567`; Windows: `.\grayshare.ps1` / `-Headless`. Launchers self-bootstrap the venv on first run.
 - Install: `python3 -m venv .venv && source .venv/bin/activate && pip install -r requirements.txt pyinstaller` (Windows: `.\.venv\Scripts\Activate.ps1`)
 - Linux GUI libs: `sudo apt install python3-gi gir1.2-webkit2-4.1 libgtk-3-0`
 - Dev (desktop): `python desktop_app.py`

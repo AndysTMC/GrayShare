@@ -8,6 +8,17 @@ GrayShare is a LAN file-sharing app: a desktop host (Windows, macOS, or Linux) w
 
 Send and receive files on the LAN, including multi-file zip bundles, a QR code with a per-launch access key, optional passcodes, live share updates, Range-aware downloads, and transfer history on disk. How it fits together: [docs/architecture.md](docs/architecture.md). Binding choices: [docs/decisions/_index.md](docs/decisions/_index.md). Agent protocol: [AGENTS.md](AGENTS.md).
 
+## Quickstart
+
+```bash
+./grayshare.sh --headless        # Linux/macOS — prints a URL + QR key
+```
+```powershell
+.\grayshare.ps1 -Headless        # Windows PowerShell
+```
+
+First run sets everything up automatically (creates the venv, installs dependencies). Drop `--headless` for the desktop window. Pick a port with `--port 4567`.
+
 ## Run from source
 
 ```bash
