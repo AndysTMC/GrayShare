@@ -34,7 +34,20 @@ grayshare update                   # update to the latest version
 
 If `command not found`, add `~/.local/bin` to your PATH (`export PATH="$HOME/.local/bin:$PATH"` in `~/.bashrc`).
 
-Windows: download the repo and run `.\grayshare.ps1 -Headless` (installer script is POSIX-only).
+Windows (PowerShell):
+
+```powershell
+irm https://raw.githubusercontent.com/AndysTMC/GrayShare/main/install.ps1 -OutFile install-grayshare.ps1
+.\install-grayshare.ps1           # review first, then run
+```
+
+Or run immediately:
+
+```powershell
+irm https://raw.githubusercontent.com/AndysTMC/GrayShare/main/install.ps1 | iex
+```
+
+Same commands afterwards (`grayshare --headless`, `grayshare update`, …) from a new terminal. Requires git and Python on PATH (`winget install --id Git.Git`, `winget install --id Python.Python.3.12`).
 
 First run sets everything up automatically (creates the venv, installs dependencies).
 
