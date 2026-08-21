@@ -33,6 +33,30 @@ $BinDir = Join-Path $env:LOCALAPPDATA "Programs\GrayShare\bin"
 function Say($msg)  { Write-Host "==> $msg" }
 function Die($msg)  { Write-Host "error: $msg" -ForegroundColor Red; exit 1 }
 
+# Windows PowerShell treats git's stderr progress ("Cloning into...") as a
+# terminating NativeCommandError when $ErrorActionPreference is Stop.
+function Invoke-Git {
+    param([Parameter(Mandatory = $true)][string[]]$GitArgs)
+    $prev = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    $nativePrev = $null
+    if (Test-Path variable:PSNativeCommandUseErrorActionPreference) {
+        $nativePrev = $PSNativeCommandUseErrorActionPreference
+        $PSNativeCommandUseErrorActionPreference = $false
+    }
+    try {
+        $null = & git @GitArgs 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            Die "git $($GitArgs -join ' ') failed (exit $LASTEXITCODE). Check git is on PATH and you have network access."
+        }
+    } finally {
+        $ErrorActionPreference = $prev
+        if ($null -ne $nativePrev) {
+            $PSNativeCommandUseErrorActionPreference = $nativePrev
+        }
+    }
+}
+
 # --- prerequisites -----------------------------------------------------------
 if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
     Die "git is required. Install it first: winget install --id Git.Git"
@@ -58,17 +82,15 @@ New-Item -ItemType Directory -Force -Path $InstallRoot, $BinDir | Out-Null
 # --- get the code ------------------------------------------------------------
 if (Test-Path (Join-Path $AppDir ".git")) {
     Say "Updating existing checkout in $AppDir"
-    Push-Location $AppDir
-    git fetch origin $Branch 2>$null | Out-Null
-    git reset --hard "origin/$Branch" | Out-Null
-    Pop-Location
+    Invoke-Git @("-C", $AppDir, "fetch", "--quiet", "origin", $Branch)
+    Invoke-Git @("-C", $AppDir, "reset", "--hard", "origin/$Branch")
 } else {
     Say "Cloning GrayShare into $AppDir"
-    if (Test-Path "$AppDir.tmp") { Remove-Item -Recurse -Force "$AppDir.tmp" }
-    git clone --depth 1 --branch $Branch $Repo "$AppDir.tmp" 2>$null | Out-Null
-    if ($LASTEXITCODE -ne 0) { Die "clone failed — check your internet connection." }
+    $TmpDir = Join-Path $InstallRoot "app.tmp"
+    if (Test-Path $TmpDir) { Remove-Item -Recurse -Force $TmpDir }
+    Invoke-Git @("clone", "--quiet", "--depth", "1", "--branch", $Branch, $Repo, $TmpDir)
     if (Test-Path $AppDir) { Remove-Item -Recurse -Force $AppDir }
-    Move-Item "$AppDir.tmp" $AppDir
+    Move-Item $TmpDir $AppDir
 }
 
 # --- python environment ------------------------------------------------------
@@ -136,8 +158,12 @@ if (-not (Test-Path `$Py)) {
 switch (`$args[0]) {
     'update' {
         Push-Location `$App
-        git fetch origin $Branch 2>`$null | Out-Null
-        git reset --hard "origin/$Branch" | Out-Null
+        `$prevEa = `$ErrorActionPreference
+        `$ErrorActionPreference = 'Continue'
+        try {
+            git -C `$App fetch --quiet origin $Branch 2>`$null | Out-Null
+            git -C `$App reset --hard "origin/$Branch" | Out-Null
+        } finally { `$ErrorActionPreference = `$prevEa }
         & `$Py -m pip install --quiet --upgrade pip
         & `$Py -m pip install --quiet -r requirements.txt
         Pop-Location

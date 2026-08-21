@@ -3,8 +3,8 @@
 !define APP_NAME "GrayShare"
 !define APP_EXE "GrayShare.exe"
 !define APP_PUBLISHER "AndysTMC"
-!define APP_VERSION "1.2.5"
-!define APP_VERSION_DWORD "1.2.5.0"
+!define APP_VERSION "1.2.6"
+!define APP_VERSION_DWORD "1.2.6.0"
 !define APP_ICON "static\installer.ico"
 
 !ifndef SOURCE_DIST_PATH
