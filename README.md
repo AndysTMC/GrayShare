@@ -10,14 +10,33 @@ Send and receive files on the LAN, including multi-file zip bundles, a QR code w
 
 ## Quickstart
 
+Install (Linux/macOS) — one command, then use `grayshare` anywhere:
+
 ```bash
-./grayshare.sh --headless        # Linux/macOS — prints a URL + QR key
-```
-```powershell
-.\grayshare.ps1 -Headless        # Windows PowerShell
+curl -fsSL https://raw.githubusercontent.com/AndysTMC/GrayShare/main/install.sh -o install-grayshare.sh
+bash install-grayshare.sh          # review first, then run
 ```
 
-First run sets everything up automatically (creates the venv, installs dependencies). Drop `--headless` for the desktop window. Pick a port with `--port 4567`.
+Or run immediately without saving:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/AndysTMC/GrayShare/main/install.sh | bash
+```
+
+Then:
+
+```bash
+grayshare --headless               # headless LAN server — prints URL + QR key
+grayshare                          # desktop window
+grayshare --port 4567              # pick a port
+grayshare update                   # update to the latest version
+```
+
+If `command not found`, add `~/.local/bin` to your PATH (`export PATH="$HOME/.local/bin:$PATH"` in `~/.bashrc`).
+
+Windows: download the repo and run `.\grayshare.ps1 -Headless` (installer script is POSIX-only).
+
+First run sets everything up automatically (creates the venv, installs dependencies).
 
 ## Run from source
 
