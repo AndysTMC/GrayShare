@@ -830,6 +830,23 @@ input[type="number"].form__input {
   text-overflow: ellipsis;
 }
 
+.share-passcode-input {
+  margin-top: 0.4rem;
+  padding: 0.35rem 0.6rem;
+  font: inherit;
+  font-size: 0.85rem;
+  max-width: 180px;
+  border: 1px solid var(--gray);
+  border-radius: 8px;
+  background: transparent;
+  color: inherit;
+}
+
+.share-passcode-input:focus {
+  outline: none;
+  border-color: var(--black);
+}
+
 .lock-chip {
   display: inline-block;
   margin-left: 0.4rem;

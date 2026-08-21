@@ -9,11 +9,7 @@
   <meta name="apple-mobile-web-app-capable" content="yes" />
   <link rel="manifest" href="/manifest.webmanifest" />
   <link rel="icon" type="image/x-icon" href="/static/app_icon.ico" />
-  <link rel="preconnect" href="https://fonts.googleapis.com" />
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-  <link
-    href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,600;0,700;1,600&family=Inter:wght@400;500;600&display=swap"
-    rel="stylesheet" />
+  <link rel="stylesheet" href="/static/fonts/fonts.css" />
   <link rel="stylesheet" href="/static/styles.css" />
 </head>
 
@@ -68,7 +64,7 @@
                 <span class="form__file-btn">Choose file</span>
                 <span class="form__file-name" id="share-file-label">No file selected</span>
               </div>
-              <input id="share-file" class="form__file-input" type="file" name="file" required />
+              <input id="share-file" class="form__file-input" type="file" name="file" multiple required />
             </div>
           </div>
 
@@ -110,7 +106,7 @@
 
     <section id="view-history" class="view view--secondary hidden" aria-labelledby="history-heading">
       <h2 class="page-title" id="history-heading">History</h2>
-      <p class="page-desc">Send, receive, and stop events on this server. History clears when the process restarts.</p>
+      <p class="page-desc">Send, receive, and stop events on this server. History is kept on disk and survives restarts.</p>
       <button type="button" id="activity-refresh" class="btn-toolbar">Refresh</button>
       <div id="activity-empty" class="empty-state hidden">No activity yet — share or receive a file on Transfer.</div>
       <ul id="activity-list" class="activity-list"></ul>
@@ -151,14 +147,6 @@
         <p class="form__hint">0 = auto (based on RAM). Reduce if the browser is slow.</p>
       </div>
 
-      <div class="settings-block">
-        <label class="form__label" for="setting-refresh">Transfer list refresh</label>
-        <div class="form__input-shell form__input-shell--narrow">
-          <input type="number" id="setting-refresh" class="form__input" min="2" max="60" step="1" value="3" />
-          <span class="form__suffix" aria-hidden="true">sec</span>
-        </div>
-        <p class="form__hint">How often the Receive list checks for active senders (2–60 seconds).</p>
-      </div>
       <div class="settings-block" id="server-port-block">
         <label class="form__label" for="setting-port">Port</label>
         <div class="form__input-shell form__input-shell--narrow">
@@ -216,6 +204,7 @@
         <div class="progress-fill" id="receive-progress-fill"></div>
       </div>
       <p id="receive-overlay-status" class="receive-overlay-status"></p>
+      <button type="button" id="receive-cancel" class="btn-stop">Cancel</button>
     </div>
   </div>
   <div id="toast-root" class="toast-root" aria-live="polite" aria-atomic="false"></div>

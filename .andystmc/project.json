@@ -1,0 +1,46 @@
+{
+  "version": 1,
+  "name": "GrayShare",
+  "tagline": "LAN file sharing from a desktop host to any browser on the network.",
+  "description": "GrayShare is a cross-platform desktop host plus a zero-install browser client for sending files over a local network. The host runs a FastAPI server (inside pywebview, or headless) and shows a QR URL with a per-boot access key; phones and other machines open that URL to send or receive. Transfers use parallel chunked uploads into a preallocated inbox file, optional passcodes, and three receive paths: a native save dialog on the host, File System Access streaming in capable browsers, and a Range-aware browser download everywhere else.",
+  "year": "2026",
+  "tags": ["file sharing", "LAN", "desktop", "PWA", "local-first"],
+  "skills": ["Python", "FastAPI", "Uvicorn", "JavaScript", "Jinja2", "PyInstaller", "NSIS", "WebView2"],
+  "highlights": [
+    "Lock-free concurrent chunk writes into a preallocated inbox file, covered by tests/test_backend.py.",
+    "HTTP Range 206/416 downloads and RFC 5987 Content-Disposition, covered by tests/test_backend.py.",
+    "Three receive paths: pywebview save-local, File System Access streaming, and native browser download.",
+    "Windows one-file exe plus NSIS installer; Linux/macOS one-file desktop binary and headless server.",
+    "Transfer history survives restarts via history.jsonl replayed into the in-memory activity log.",
+    "Per-boot access key plus constant-time passcodes; UPnP is opt-in and passcode-gated."
+  ],
+  "story": {
+    "why": "People on the same LAN still need to move large files without accounts, cloud uploads, or installing a client on every phone.",
+    "problem": "Mixed Windows, macOS, Linux, and mobile browsers on a private network have no simple host-and-scan path for multi-gigabyte files that stays off the public internet.",
+    "challenges": [
+      "Parallel chunk uploads write disjoint offsets through separate handles so workers need no session lock (main.py).",
+      "Chromium allows only one createWritable stream per file handle, so parallel download writes are queued (static/app.js).",
+      "The UI process re-execs sys.executable with --server-only rather than importing main.py, which would create a second backend (desktop_app.py).",
+      "Classic zip headers have no ZIP64, so multi-file send bundles must stay under 4 GiB (static/app.js).",
+      "UPnP WAN mapping is refused unless GRAYSHARE_REQUIRE_PASSCODE is set, keeping the file server off the public internet (desktop_app.py)."
+    ],
+    "designDecisions": [
+      "Share listing and SSE require a per-boot ACCESS_KEY carried in the QR URL as ?k= (main.py).",
+      "Chunked uploads preallocate the final inbox file and write each chunk at offset with no merge phase (main.py).",
+      "Desktop save, clear-data, port config, and host settings.json writes are loopback-only (main.py).",
+      "Loopback clients persist settings to settings.json; LAN browsers keep a separate copy in localStorage (static/app.js).",
+      "Same-volume desktop saves use os.replace and then end the share because the inbox copy is consumed (main.py).",
+      "SSE pushes share events while a slower poll remains as a fallback for proxies that drop EventSource (static/app.js)."
+    ]
+  },
+  "future": {
+    "next": "Cover the three receive paths in tests; tests/test_backend.py only exercises Range, chunks, passcodes, and history.",
+    "roadmap": [
+      "Implement chunked uploads for FILES_STORAGE_MODE=smb; share_init currently returns 501.",
+      "Call configure_runtime_control from the child backend so /api/app/save-and-close is not 501.",
+      "Add a CI job; pytest is invoked in tests/test_backend.py but is not in requirements.txt."
+    ],
+    "upcomingFeatures": ["Chunked uploads on SMB storage"],
+    "ideas": []
+  }
+}

@@ -44,6 +44,8 @@ let shareHeartbeatInFlight = false;
 let lastSharesRenderKey = "";
 let activePointerCount = 0;
 let deferUiRefreshUntil = 0;
+let activeReceiveAbort = null;
+let activeUploadAbort = null;
 
 const DOWNLOAD_RETRY_LIMIT = 5;
 const DOWNLOAD_BASE_BACKOFF_MS = 400;
@@ -91,8 +93,175 @@ function formatBytes(n) {
   return `${v.toFixed(decimals)} ${units[u]}`;
 }
 
+/**
+ * Rolling transfer-rate tracker (bytes/sec over a sliding window).
+ * Feed it (loaded, total) on each progress tick; read .speedBps / .etaText.
+ */
+function createRateTracker() {
+  const samples = []; // {t, loaded}
+  let lastLoaded = 0;
+  let lastTotal = 0;
+  return {
+    update(loaded, total) {
+      const now = performance.now();
+      if (loaded < lastLoaded) {
+        // Transfer restarted; reset the window.
+        samples.length = 0;
+      }
+      samples.push({ t: now, loaded });
+      while (samples.length > 2 && now - samples[0].t > 4000) {
+        samples.shift();
+      }
+      lastLoaded = loaded;
+      if (total) lastTotal = total;
+    },
+    get speedBps() {
+      if (samples.length < 2) return 0;
+      const first = samples[0];
+      const last = samples[samples.length - 1];
+      const secs = (last.t - first.t) / 1000;
+      if (secs <= 0.2) return 0;
+      return Math.max(0, (last.loaded - first.loaded) / secs);
+    },
+    get etaText() {
+      const speed = this.speedBps;
+      if (!speed || !lastTotal || lastLoaded >= lastTotal) return "";
+      const remainSecs = Math.round((lastTotal - lastLoaded) / speed);
+      if (!Number.isFinite(remainSecs) || remainSecs <= 0) return "";
+      if (remainSecs < 60) return `${remainSecs}s left`;
+      const mins = Math.floor(remainSecs / 60);
+      const secs = remainSecs % 60;
+      if (mins < 60) return `${mins}m ${secs}s left`;
+      return `${Math.floor(mins / 60)}h ${mins % 60}m left`;
+    },
+  };
+}
+
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// --- Minimal store-method ZIP writer (multi-file send) ----------------------
+// Builds a .zip Blob from multiple File objects without loading them into
+// memory (Blob parts are backed by the source files on disk). Store method =
+// no compression, since LAN transfer speed makes CPU time the bottleneck.
+const ZIP_CRC_TABLE = (() => {
+  const table = new Uint32Array(256);
+  for (let n = 0; n < 256; n += 1) {
+    let c = n;
+    for (let k = 0; k < 8; k += 1) {
+      c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+    }
+    table[n] = c >>> 0;
+  }
+  return table;
+})();
+
+async function crc32OfBlob(blob) {
+  let crc = 0xffffffff;
+  const reader = blob.stream().getReader();
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    for (let i = 0; i < value.length; i += 1) {
+      crc = ZIP_CRC_TABLE[(crc ^ value[i]) & 0xff] ^ (crc >>> 8);
+    }
+  }
+  return (crc ^ 0xffffffff) >>> 0;
+}
+
+function dosDateTime(date) {
+  const time =
+    ((date.getHours() & 0x1f) << 11) |
+    ((date.getMinutes() & 0x3f) << 5) |
+    ((Math.floor(date.getSeconds() / 2)) & 0x1f);
+  const day =
+    (((date.getFullYear() - 1980) & 0x7f) << 9) |
+    (((date.getMonth() + 1) & 0xf) << 5) |
+    (date.getDate() & 0x1f);
+  return { time, day };
+}
+
+/**
+ * Bundle files into a single zip Blob (store method).
+ * Guarded to < 4 GiB total: classic zip headers, no zip64 complexity.
+ *
+ * Note on I/O: CRC-32 values must be known before local headers are written,
+ * so each source file is streamed once here and again during upload. ZIP
+ * bit-3 data descriptors would remove the first pass, but only for a
+ * streaming (non-seekable) zip — incompatible with the slice-based parallel
+ * chunked uploader, which needs a complete immutable Blob. The extra pass is
+ * sequential-SSD-speed and overlapped below, well under LAN transfer time.
+ */
+async function buildZipBlob(files, onProgress) {
+  const encoder = new TextEncoder();
+  // Compute all CRCs concurrently — independent reads overlap on the disk.
+  const crcs = await Promise.all(files.map((f) => crc32OfBlob(f)));
+
+  const locals = [];
+  const centrals = [];
+  let offset = 0;
+
+  for (let i = 0; i < files.length; i += 1) {
+    const f = files[i];
+    const crc = crcs[i];
+    const { time, day } = dosDateTime(new Date(f.lastModified || Date.now()));
+    // UTF-8 filename flag (0x0800); sanitize path separators.
+    const safeName = f.name.replace(/[\\/:*?"<>|]/g, "_");
+    const nameBytes = encoder.encode(safeName);
+
+    const localHeader = new DataView(new ArrayBuffer(30));
+    localHeader.setUint32(0, 0x04034b50, true);
+    localHeader.setUint16(4, 20, true);      // version needed
+    localHeader.setUint16(6, 0x0800, true);  // flags: UTF-8 names
+    localHeader.setUint16(8, 0, true);       // method: store
+    localHeader.setUint16(10, time, true);
+    localHeader.setUint16(12, day, true);
+    localHeader.setUint32(14, crc, true);
+    localHeader.setUint32(18, f.size, true); // compressed size
+    localHeader.setUint32(22, f.size, true); // uncompressed size
+    localHeader.setUint16(26, nameBytes.length, true);
+    localHeader.setUint16(28, 0, true);      // extra len
+
+    locals.push(new Blob([localHeader.buffer, nameBytes, f]));
+
+    const central = new DataView(new ArrayBuffer(46));
+    central.setUint32(0, 0x02014b50, true);
+    central.setUint16(4, 20, true);          // version made by
+    central.setUint16(6, 20, true);          // version needed
+    central.setUint16(8, 0x0800, true);
+    central.setUint16(10, 0, true);
+    central.setUint16(12, time, true);
+    central.setUint16(14, day, true);
+    central.setUint32(16, crc, true);
+    central.setUint32(20, f.size, true);
+    central.setUint32(24, f.size, true);
+    central.setUint16(28, nameBytes.length, true);
+    central.setUint16(30, 0, true);          // extra len
+    central.setUint16(32, 0, true);          // comment len
+    central.setUint16(34, 0, true);          // disk number
+    central.setUint16(36, 0, true);          // internal attrs
+    central.setUint32(38, 0, true);          // external attrs
+    central.setUint32(42, offset, true);     // local header offset
+    centrals.push(new Blob([central.buffer, nameBytes]));
+
+    offset += 30 + nameBytes.length + f.size;
+  }
+
+  const centralStart = offset;
+  let centralSize = 0;
+  for (const c of centrals) centralSize += c.size;
+
+  const eocd = new DataView(new ArrayBuffer(22));
+  eocd.setUint32(0, 0x06054b50, true);
+  eocd.setUint16(8, files.length, true);
+  eocd.setUint16(10, files.length, true);
+  eocd.setUint32(12, centralSize, true);
+  eocd.setUint32(16, centralStart, true);
+
+  return new Blob([...locals, ...centrals, new Blob([eocd.buffer])], {
+    type: "application/zip",
+  });
 }
 
 function shouldRetryStatus(status) {
@@ -157,7 +326,7 @@ async function measureUploadSpeed() {
   return n / Math.max(secs, 0.001);
 }
 
-async function uploadFileInChunks(file, displayName, passcode, onChunkProgress, manualChunkBytes = 0, manualWorkers = 0) {
+async function uploadFileInChunks(file, displayName, passcode, onChunkProgress, manualChunkBytes = 0, manualWorkers = 0, signal = null) {
   const speed = await measureUploadSpeed();
   const chunkBytes = manualChunkBytes > 0 ? manualChunkBytes * 1024 * 1024 : clampChunkBytes(speed);
   const workers = manualWorkers > 0 ? manualWorkers : computeParallelWorkers(chunkBytes);
@@ -182,33 +351,65 @@ async function uploadFileInChunks(file, displayName, passcode, onChunkProgress, 
   const { sharer_id, total_chunks: serverChunks } = initData;
   const nChunks = serverChunks ?? Math.max(1, Math.ceil(file.size / chunkBytes));
 
+  // Worker pool: each worker pulls the next chunk index from a shared cursor.
+  // No batch barriers — a slow chunk never stalls the others.
   let done = 0;
-  for (let i = 0; i < nChunks; i += workers) {
-    const end = Math.min(i + workers, nChunks);
-    const batch = [];
-    for (let j = i; j < end; j++) {
+  let nextChunk = 0;
+  let aborted = false;
+
+  async function uploadWorker() {
+    while (!aborted) {
+      const j = nextChunk;
+      if (j >= nChunks) return;
+      nextChunk += 1;
       const start = j * chunkBytes;
       const sliceEnd = Math.min(start + chunkBytes, file.size);
-      const blob = file.slice(start, sliceEnd);
       const fd = new FormData();
       fd.append("chunk_index", String(j));
-      fd.append("file", blob, "chunk.bin");
-      batch.push(
-        fetch(`/api/share/${sharer_id}/chunk`, { method: "POST", body: fd }).then(async (res) => {
-          if (!res.ok) {
-            const err = await res.json().catch(() => ({}));
-            throw err;
-          }
-          done += 1;
-          onChunkProgress?.(done, nChunks, chunkBytes, workers);
-          return res.json();
-        }),
-      );
+      fd.append("file", file.slice(start, sliceEnd), "chunk.bin");
+      try {
+        const res = await fetch(`/api/share/${sharer_id}/chunk`, {
+          method: "POST",
+          body: fd,
+          signal,
+        });
+        if (!res.ok) {
+          const err = await res.json().catch(() => ({}));
+          throw err;
+        }
+        done += 1;
+        onChunkProgress?.(done, nChunks, chunkBytes, workers);
+      } catch (err) {
+        if (signal?.aborted) {
+          aborted = true;
+          return;
+        }
+        aborted = true;
+        throw err;
+      }
     }
-    await Promise.all(batch);
+  }
+
+  try {
+    await Promise.all(
+      Array.from({ length: Math.min(workers, nChunks) }, () => uploadWorker()),
+    );
+  } catch (err) {
+    aborted = true;
+    // Tell the server to discard the partial upload instead of waiting for
+    // the stale timeout.
+    void fetch(`/api/share/${sharer_id}/stop`, { method: "POST" }).catch(() => {});
+    throw err;
+  }
+  if (signal?.aborted) {
+    void fetch(`/api/share/${sharer_id}/stop`, { method: "POST" }).catch(() => {});
+    throw new DOMException("Upload cancelled", "AbortError");
   }
   onChunkProgress?.(nChunks, nChunks, chunkBytes, workers);
-  const finalRes = await fetch(`/api/share/${sharer_id}/finalize`, { method: "POST" });
+  const finalRes = await fetch(`/api/share/${sharer_id}/finalize`, {
+    method: "POST",
+    signal,
+  });
   if (!finalRes.ok) {
     const err = await finalRes.json().catch(() => ({}));
     throw err;
@@ -222,14 +423,118 @@ async function uploadFileInChunks(file, displayName, passcode, onChunkProgress, 
   };
 }
 
-async function downloadFileAdaptive(share, passcode, onProgress) {
+/** Passcode goes in a header (not the URL) whenever the transport allows it. */
+function passcodeHeaders(passcode) {
+  const headers = {};
+  if (passcode) {
+    headers["X-GrayShare-Passcode"] = passcode;
+  }
+  return headers;
+}
+
+/**
+ * Above this size, browsers without the File System Access API must not
+ * accumulate the file as an in-memory Blob — hand off to the native
+ * browser downloader instead (it streams to disk and supports resume).
+ */
+const BROWSER_BLOB_LIMIT_BYTES = 1.5 * 1024 * 1024 * 1024; // 1.5 GiB
+
+/**
+ * Adapter around a File System Access save-handle so downloads can write
+ * chunks directly to disk at their offset instead of buffering in RAM.
+ *
+ * Chromium allows only ONE active createWritable() stream per file handle —
+ * a second concurrent call rejects with NoModificationAllowedError. Parallel
+ * download workers therefore share a single persistent stream, and writes are
+ * serialized through an internal promise queue (the writes themselves target
+ * disjoint offsets, so ordering does not matter, only exclusivity).
+ */
+function createFileHandleSink(handle) {
+  let streamPromise = null;
+  let writeQueue = Promise.resolve();
+  let closed = false;
+
+  function getStream() {
+    if (!streamPromise) {
+      streamPromise = handle.createWritable({ keepExistingData: true });
+    }
+    return streamPromise;
+  }
+
+  return {
+    /** Enqueue one offset write; resolves when it has hit the stream. */
+    write(blob, offset) {
+      if (closed) {
+        return Promise.reject(new Error("Sink already closed"));
+      }
+      const job = async () => {
+        const stream = await getStream();
+        await stream.write({ type: "write", position: offset, data: blob });
+      };
+      // Swallow errors inside the chain so one failed write doesn't poison
+      // the queue; the failing caller still sees the rejection.
+      writeQueue = writeQueue.then(job, job);
+      return writeQueue;
+    },
+    /**
+     * Streamed single-writer path (used for single-chunk downloads).
+     * Returns a sequential writer chained onto the same queue.
+     */
+    openStream() {
+      let streamRef = null;
+      return {
+        write(value) {
+          const job = async () => {
+            if (!streamRef) {
+              streamRef = await getStream();
+            }
+            await streamRef.write(value);
+          };
+          writeQueue = writeQueue.then(job, job);
+          return writeQueue;
+        },
+        close() {
+          const job = async () => {
+            if (streamRef) {
+              await streamRef.close();
+            }
+          };
+          writeQueue = writeQueue.then(job, job);
+          return writeQueue;
+        },
+      };
+    },
+    /** Wait for all queued writes, then close the underlying stream. */
+    async close() {
+      if (closed) return;
+      closed = true;
+      await writeQueue.catch(() => {});
+      if (streamPromise) {
+        const stream = await streamPromise;
+        await stream.close().catch(() => {});
+      }
+    },
+  };
+}
+
+/**
+ * Parallel chunked download with a worker pool.
+ *
+ * - sink: optional { write(blob, offset), openStream() } — when provided
+ *   (FS Access API), chunks stream straight to disk and nothing accumulates
+ *   in memory.
+ * - Without a sink, chunks accumulate as a Blob; large files without a sink
+ *   must use the native browser download path instead.
+ * - signal: AbortController signal for cancel support.
+ */
+async function downloadFileAdaptive(share, passcode, onProgress, { sink = null, signal = null } = {}) {
   const pq = encodeURIComponent(passcode || "");
   let infoRes = null;
   for (let attempt = 1; attempt <= DOWNLOAD_RETRY_LIMIT; attempt += 1) {
     try {
       infoRes = await fetchWithTimeout(
         `/api/receive/${share.sharer_id}/info?passcode=${pq}`,
-        { method: "GET" },
+        { method: "GET", headers: passcodeHeaders(passcode), signal },
         DOWNLOAD_TIMEOUT_MS,
       );
       if (!infoRes.ok && shouldRetryStatus(infoRes.status) && attempt < DOWNLOAD_RETRY_LIMIT) {
@@ -237,7 +542,8 @@ async function downloadFileAdaptive(share, passcode, onProgress) {
         continue;
       }
       break;
-    } catch {
+    } catch (err) {
+      if (signal?.aborted) throw err;
       if (attempt >= DOWNLOAD_RETRY_LIMIT) {
         throw new Error("Unable to connect to sender.");
       }
@@ -252,47 +558,123 @@ async function downloadFileAdaptive(share, passcode, onProgress) {
   }
   const info = await infoRes.json();
 
+  // Single-chunk files: simple streaming GET with progress.
   if (info.chunk_count === 1) {
-    const body = new FormData();
-    body.append("passcode", passcode);
-    return postFormWithDownloadProgressRetry(`/api/receive/${share.sharer_id}`, body, onProgress);
+    const res = await fetchWithTimeout(
+      `/api/receive/${share.sharer_id}/chunk/0?passcode=${pq}`,
+      { method: "GET", headers: passcodeHeaders(passcode), signal },
+      DOWNLOAD_TIMEOUT_MS,
+    );
+    if (!res.ok) {
+      throw await parseResponseError(res, "Download failed");
+    }
+    return readResponseWithProgress(res, onProgress, sink);
   }
 
   let workers = computeParallelWorkers(info.chunk_size);
-  const parts = new Array(info.chunk_count);
+  const parts = sink ? null : new Array(info.chunk_count);
   let loaded = 0;
   const totalBytes = info.size_bytes || 1;
-  const pending = Array.from({ length: info.chunk_count }, (_, i) => i);
+  let nextChunk = 0;
+  let failedIndices = [];
 
-  while (pending.length) {
-    const batch = pending.splice(0, workers);
-    const results = await Promise.allSettled(
-      batch.map((j) =>
-        downloadChunkWithRetry(`/api/receive/${share.sharer_id}/chunk/${j}?passcode=${pq}`).then((b) => {
-          parts[j] = b;
-          loaded += b.size;
-          onProgress?.(loaded / totalBytes, loaded, totalBytes);
-        }),
-      ),
-    );
-
-    const failed = [];
-    for (let i = 0; i < results.length; i += 1) {
-      if (results[i].status === "rejected") {
-        failed.push(batch[i]);
+  async function downloadWorker() {
+    while (nextChunk < info.chunk_count) {
+      const j = nextChunk;
+      nextChunk += 1;
+      try {
+        const res = await fetchWithTimeout(
+          `/api/receive/${share.sharer_id}/chunk/${j}?passcode=${pq}`,
+          { method: "GET", headers: passcodeHeaders(passcode), signal },
+          DOWNLOAD_TIMEOUT_MS,
+        );
+        if (!res.ok) {
+          throw await parseResponseError(res, "Chunk download failed");
+        }
+        const blob = await res.blob();
+        if (sink) {
+          await sink.write(blob, j * info.chunk_size);
+        } else {
+          parts[j] = blob;
+        }
+        loaded += blob.size;
+        onProgress?.(Math.min(1, loaded / totalBytes), loaded, totalBytes);
+      } catch (err) {
+        if (signal?.aborted) return;
+        failedIndices.push(j);
+        return; // worker exits; pool shrinks naturally on trouble
       }
-    }
-
-    if (failed.length) {
-      pending.push(...failed);
-      if (workers > 1) {
-        workers = Math.max(1, Math.floor(workers / 2));
-      }
-      receiveOverlayStatus.textContent = `Packet loss detected. Retrying ${failed.length} chunk(s) with ${workers} stream(s)…`;
-      await sleep(DOWNLOAD_BASE_BACKOFF_MS);
     }
   }
+
+  await Promise.all(
+    Array.from({ length: Math.min(workers, info.chunk_count) }, () => downloadWorker()),
+  );
+
+  // Retry any failed chunks serially with backoff before giving up.
+  while (failedIndices.length) {
+    receiveOverlayStatus.textContent = `Retrying ${failedIndices.length} chunk(s)…`;
+    await sleep(DOWNLOAD_BASE_BACKOFF_MS);
+    const retryList = failedIndices;
+    failedIndices = [];
+    for (const j of retryList) {
+      try {
+        const res = await fetchWithTimeout(
+          `/api/receive/${share.sharer_id}/chunk/${j}?passcode=${pq}`,
+          { method: "GET", headers: passcodeHeaders(passcode), signal },
+          DOWNLOAD_TIMEOUT_MS,
+        );
+        if (!res.ok) throw new Error("Chunk retry failed");
+        const blob = await res.blob();
+        if (sink) {
+          await sink.write(blob, j * info.chunk_size);
+        } else {
+          parts[j] = blob;
+        }
+        loaded += blob.size;
+        onProgress?.(Math.min(1, loaded / totalBytes), loaded, totalBytes);
+      } catch (err) {
+        if (signal?.aborted) throw err;
+        failedIndices.push(j);
+      }
+    }
+    if (failedIndices.length) {
+      workers = Math.max(1, Math.floor(workers / 2));
+    }
+  }
+
+  if (sink) {
+    return null; // data already written to disk
+  }
   return new Blob(parts);
+}
+
+/** Stream a fetch Response body with progress; optionally into a file sink. */
+async function readResponseWithProgress(res, onProgress, sink) {
+  const total = Number(res.headers.get("Content-Length") || 0);
+  let loaded = 0;
+  const writable = sink ? await sink.openStream() : null;
+  // Collect chunks so the no-sink path can still return a Blob — res.blob()
+  // would fail here because the body stream is already consumed.
+  const chunks = [];
+  const reader = res.body.getReader();
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (writable) {
+        await writable.write(value);
+      } else {
+        chunks.push(value);
+      }
+      loaded += value.byteLength;
+      onProgress?.(total ? loaded / total : -1, loaded, total);
+    }
+  } finally {
+    reader.releaseLock();
+    if (writable) await writable.close();
+  }
+  return sink ? null : new Blob(chunks, { type: res.headers.get("Content-Type") || "application/octet-stream" });
 }
 
 function setShareStatus(message, kind = "info") {
@@ -334,11 +716,23 @@ function setMode(mode) {
 modeIdleBtn.addEventListener("click", () => setMode("idle"));
 modeShareBtn.addEventListener("click", () => setMode("share"));
 
+function describeFileSelection(fileList) {
+  const count = fileList?.length || 0;
+  if (!count) return "No file selected";
+  if (count === 1) return fileList[0].name;
+  const totalBytes = Array.from(fileList).reduce((sum, f) => sum + f.size, 0);
+  return `${count} files · ${formatBytes(totalBytes)} (sent as .zip)`;
+}
+
+function stripExt(name) {
+  return String(name || "file").replace(/\.[^.]+$/, "") || "file";
+}
+
 if (shareFileInput && shareFileLabel) {
   shareFileInput.addEventListener("change", () => {
-    const f = shareFileInput.files?.[0];
-    shareFileLabel.textContent = f ? f.name : "No file selected";
-    shareFileLabel.classList.toggle("form__file-name--selected", Boolean(f));
+    const label = describeFileSelection(shareFileInput.files);
+    shareFileLabel.textContent = label;
+    shareFileLabel.classList.toggle("form__file-name--selected", Boolean(shareFileInput.files?.length));
   });
   const fileShell = shareFileInput.closest(".form__file-shell");
   if (fileShell) {
@@ -358,9 +752,9 @@ if (shareFileInput && shareFileLabel) {
       const dt = e.dataTransfer;
       if (!dt || !dt.files || !dt.files.length) return;
       shareFileInput.files = dt.files;
-      const f = dt.files[0];
-      shareFileLabel.textContent = f ? f.name : "No file selected";
-      shareFileLabel.classList.toggle("form__file-name--selected", Boolean(f));
+      const label = describeFileSelection(dt.files);
+      shareFileLabel.textContent = label;
+      shareFileLabel.classList.toggle("form__file-name--selected", true);
     });
   }
 }
@@ -370,14 +764,12 @@ const viewHistory = document.getElementById("view-history");
 const viewSettings = document.getElementById("view-settings");
 const navHistory = document.getElementById("nav-history");
 const portSettingsBlock = document.getElementById("server-port-block");
-const settingRefreshBlock = document.getElementById("setting-refresh")?.closest(".settings-block");
 const clearDataBlock = document.getElementById("clear-data")?.closest(".settings-block");
 const settingPortInput = document.getElementById("setting-port");
 const settingPortStatus = document.getElementById("setting-port-status");
 const saveCloseAppBtn = document.getElementById("save-close-app");
 
 function applyClientVisibility() {
-  if (settingRefreshBlock) settingRefreshBlock.remove();
   if (saveCloseAppBtn) saveCloseAppBtn.remove();
   if (isLoopbackOrigin()) return;
   if (viewHistory) viewHistory.classList.add("hidden");
@@ -413,7 +805,6 @@ const DEFAULT_CLIENT_SETTINGS = {
   display_name: "",
   chunk_mb: 0,
   threads: 0,
-  refresh_sec: 5,
   theme: "light",
 };
 const CLIENT_SETTINGS_STORAGE_KEY = "grayshare.clientSettings";
@@ -437,7 +828,6 @@ function normalizeClientSettings(raw = {}) {
     display_name: typeof raw.display_name === "string" ? raw.display_name.trim() : "",
     chunk_mb: clampInt(raw.chunk_mb ?? 0, 0, 256, 0),
     threads: clampInt(raw.threads ?? 0, 0, 16, 0),
-    refresh_sec: 5,
     theme: raw.theme === "dark" ? "dark" : "light",
   };
 }
@@ -502,13 +892,75 @@ function getRefreshSec() {
   return 5;
 }
 
+// --- Live presence: SSE with polling fallback -------------------------------
+// When the /api/events stream is connected, share changes arrive instantly and
+// the 5s poll is stretched to a low-frequency safety net. When SSE fails
+// (older proxies, exotic browsers), the normal 5s poll continues.
+let eventSource = null;
+let sseConnected = false;
 let pollTimerId = null;
-function configureSharePolling() {
+
+function stopSharePolling() {
+  if (pollTimerId) {
+    clearTimeout(pollTimerId);
+    pollTimerId = null;
+  }
+}
+
+function scheduleSharePoll(delayMs) {
   if (pollTimerId) clearTimeout(pollTimerId);
   pollTimerId = setTimeout(async function runSharePoll() {
     await refreshShares({ allowDefer: true });
-    pollTimerId = setTimeout(runSharePoll, getRefreshSec() * 1000);
-  }, getRefreshSec() * 1000);
+    scheduleSharePoll(getRefreshSec() * 1000);
+  }, delayMs);
+}
+
+function configureSharePolling() {
+  scheduleSharePoll(getRefreshSec() * 1000);
+  setupEventStream();
+}
+
+function setupEventStream() {
+  if (!window.EventSource || eventSource) {
+    return;
+  }
+  const key = accessKey();
+  if (!key) {
+    return; // unauthenticated clients have nothing to subscribe to
+  }
+  try {
+    eventSource = new EventSource(`/api/events?k=${encodeURIComponent(key)}`);
+  } catch {
+    eventSource = null;
+    return;
+  }
+  eventSource.onopen = () => {
+    sseConnected = true;
+    // Live push is active: keep only a slow safety-net poll.
+    scheduleSharePoll(30000);
+  };
+  eventSource.onerror = () => {
+    sseConnected = false;
+    // EventSource auto-reconnects; meanwhile restore the fast poll.
+    scheduleSharePoll(getRefreshSec() * 1000);
+  };
+  eventSource.onmessage = (evt) => {
+    let message = null;
+    try {
+      message = JSON.parse(evt.data);
+    } catch {
+      return;
+    }
+    if (!message || !message.type) return;
+    if (message.type === "activity") {
+      // Share started/stopped — refresh immediately (bypasses defer logic
+      // so receivers see new shares sub-second).
+      void refreshShares();
+      if (!viewHistory?.classList.contains("hidden")) {
+        void loadActivityList();
+      }
+    }
+  };
 }
 
 function getTheme() {
@@ -1035,19 +1487,10 @@ async function chooseBrowserSaveHandle(filename) {
   }
 }
 
-async function writeBlobToHandle(handle, blob) {
-  const writable = await handle.createWritable();
-  try {
-    await writable.write(blob);
-  } finally {
-    await writable.close();
-  }
-}
-
 async function saveShareLocally(share, passcode, targetPath) {
   const res = await fetch(`/api/receive/${share.sharer_id}/save-local`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", ...passcodeHeaders(passcode) },
     body: JSON.stringify({
       passcode: passcode || "",
       target_path: targetPath,
@@ -1063,6 +1506,10 @@ function triggerNativeBrowserDownload(share, passcode) {
   const url = new URL(`/api/receive/${share.sharer_id}/download`, window.location.origin);
   if (passcode) {
     url.searchParams.set("passcode", passcode);
+  }
+  const key = accessKey();
+  if (key) {
+    url.searchParams.set("k", key);
   }
   const link = document.createElement("a");
   link.href = url.toString();
@@ -1225,49 +1672,6 @@ if (clearDataBtn) {
   });
 }
 
-async function downloadChunkWithRetry(url, maxAttempts = DOWNLOAD_RETRY_LIMIT) {
-  let lastErr = null;
-  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
-    try {
-      const res = await fetchWithTimeout(url, { method: "GET" }, DOWNLOAD_TIMEOUT_MS);
-      if (!res.ok) {
-        const err = await parseResponseError(res, "Chunk download failed");
-        const retryable = shouldRetryStatus(res.status);
-        lastErr = err;
-        if (retryable && attempt < maxAttempts) {
-          await sleep(computeBackoff(attempt));
-          continue;
-        }
-        throw err;
-      }
-      return await res.blob();
-    } catch (err) {
-      lastErr = err;
-      if (attempt >= maxAttempts) {
-        throw lastErr;
-      }
-      await sleep(computeBackoff(attempt));
-    }
-  }
-  throw lastErr || new Error("Chunk download failed");
-}
-
-async function postFormWithDownloadProgressRetry(url, formData, onProgress, maxAttempts = DOWNLOAD_RETRY_LIMIT) {
-  let lastErr = null;
-  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
-    try {
-      return await postFormWithDownloadProgress(url, formData, onProgress);
-    } catch (err) {
-      lastErr = err;
-      if (attempt >= maxAttempts) {
-        throw lastErr;
-      }
-      await sleep(computeBackoff(attempt));
-    }
-  }
-  throw lastErr || new Error("Download failed");
-}
-
 function startReceiveHealthPing() {
   stopReceiveHealthPing();
   receiveHealthTimerId = setTimeout(async function runReceiveHealthPing() {
@@ -1307,6 +1711,10 @@ function showReceiveOverlay(filename) {
   receiveProgressBar.classList.add("indeterminate");
   receiveProgressFill.style.width = "0%";
   receiveOverlayStatus.textContent = "Connecting to server…";
+  const cancelBtn = document.getElementById("receive-cancel");
+  if (cancelBtn) {
+    cancelBtn.classList.remove("hidden");
+  }
 }
 
 function hideReceiveOverlay() {
@@ -1315,58 +1723,21 @@ function hideReceiveOverlay() {
   receiveProgressBar.classList.remove("indeterminate");
   receiveProgressFill.style.width = "0%";
   receiveOverlayStatus.textContent = "";
+  const cancelBtn = document.getElementById("receive-cancel");
+  if (cancelBtn) {
+    cancelBtn.classList.add("hidden");
+  }
 }
 
-/**
- * POST form and track *download* progress (response body).
- * Server should send Content-Length for accurate % on large files.
- */
-function postFormWithDownloadProgress(url, formData, onProgress) {
-  return new Promise((resolve, reject) => {
-    const xhr = new XMLHttpRequest();
-    xhr.open("POST", url);
-    xhr.responseType = "blob";
-
-    xhr.onprogress = (e) => {
-      if (e.lengthComputable && e.total > 0) {
-        receiveProgressBar.classList.remove("indeterminate");
-        onProgress(e.loaded / e.total, e.loaded, e.total);
-      } else {
-        onProgress(-1, e.loaded, 0);
-      }
-    };
-
-    xhr.onload = () => {
-      if (xhr.status >= 200 && xhr.status < 300) {
-        const ct = xhr.getResponseHeader("Content-Type") || "";
-        if (ct.includes("application/json")) {
-          const reader = new FileReader();
-          reader.onload = () => {
-            try {
-              reject(JSON.parse(reader.result));
-            } catch {
-              reject(new Error("Invalid response"));
-            }
-          };
-          reader.readAsText(xhr.response);
-          return;
-        }
-        resolve(xhr.response);
-        return;
-      }
-      const reader = new FileReader();
-      reader.onload = () => {
-        try {
-          reject(JSON.parse(reader.result));
-        } catch {
-          reject(new Error(xhr.statusText || "Download failed"));
-        }
-      };
-      reader.readAsText(xhr.response);
-    };
-
-    xhr.onerror = () => reject(new Error("Network error"));
-    xhr.send(formData);
+const receiveCancelBtn = document.getElementById("receive-cancel");
+if (receiveCancelBtn) {
+  receiveCancelBtn.addEventListener("click", () => {
+    if (activeReceiveAbort) {
+      activeReceiveAbort.abort();
+    }
+    if (activeUploadAbort) {
+      activeUploadAbort.abort();
+    }
   });
 }
 
@@ -1416,6 +1787,50 @@ function setSharesEmptyState(message) {
   sharesList.innerHTML = `<li class="empty">${message}</li>`;
 }
 
+/** Access key (?k=...) that scopes which shares this client may see. */
+const ACCESS_KEY_STORAGE = "grayshare.accessKey";
+
+function captureAccessKey() {
+  try {
+    const url = new URL(window.location.href);
+    const k = (url.searchParams.get("k") || "").trim();
+    if (k) {
+      window.localStorage.setItem(ACCESS_KEY_STORAGE, k);
+      url.searchParams.delete("k");
+      window.history.replaceState(null, "", url.toString());
+    }
+  } catch {
+  }
+  try {
+    return window.localStorage.getItem(ACCESS_KEY_STORAGE) || "";
+  } catch {
+    return "";
+  }
+}
+
+function accessKey() {
+  return accessKeyValue;
+}
+
+/** Drop a rejected key so the next QR scan can install the fresh one. */
+function invalidateAccessKey() {
+  accessKeyValue = "";
+  try {
+    window.localStorage.removeItem(ACCESS_KEY_STORAGE);
+  } catch {
+  }
+  if (eventSource) {
+    try {
+      eventSource.close();
+    } catch {
+    }
+    eventSource = null;
+    sseConnected = false;
+  }
+}
+
+let accessKeyValue = "";
+
 async function refreshShares({ allowDefer = false } = {}) {
   if (!viewTransfer || viewTransfer.classList.contains("hidden")) {
     return;
@@ -1431,7 +1846,20 @@ async function refreshShares({ allowDefer = false } = {}) {
   refreshSharesInFlight = true;
   let shares = [];
   try {
-    const res = await fetchWithTimeout("/api/shares", { method: "GET" }, HEALTH_PING_TIMEOUT_MS);
+    const key = accessKey();
+    const res = await fetchWithTimeout(
+      `/api/shares${key ? `?k=${encodeURIComponent(key)}` : ""}`,
+      { method: "GET" },
+      HEALTH_PING_TIMEOUT_MS,
+    );
+    if (res.status === 403) {
+      // The stored key was rejected — the host restarted and rotated it.
+      // Drop it so the next QR scan takes effect, and tell the user to rescan.
+      invalidateAccessKey();
+      setSharesEmptyState("Connection expired — scan the sender's QR code again to reconnect.");
+      refreshSharesInFlight = false;
+      return;
+    }
     if (!res.ok) {
       throw new Error("Unable to load active sharers");
     }
@@ -1489,15 +1917,23 @@ async function refreshShares({ allowDefer = false } = {}) {
     main.appendChild(name);
     main.appendChild(meta);
 
+    // Inline passcode input — no jarring window.prompt.
+    let passcodeInput = null;
+    if (share.has_passcode) {
+      passcodeInput = document.createElement("input");
+      passcodeInput.type = "password";
+      passcodeInput.className = "share-passcode-input";
+      passcodeInput.placeholder = "Passcode";
+      passcodeInput.autocomplete = "off";
+      main.appendChild(passcodeInput);
+    }
+
     const btn = document.createElement("button");
     btn.type = "button";
     btn.className = "btn-list-receive";
     btn.textContent = "Receive";
     btn.addEventListener("click", async () => {
-      let passcode = "";
-      if (share.has_passcode) {
-        passcode = prompt(`Passcode required for ${share.display_name}`) || "";
-      }
+      const passcode = passcodeInput ? passcodeInput.value.trim() : "";
 
       const prevLabel = btn.textContent;
       let desktopSavePath = "";
@@ -1523,6 +1959,8 @@ async function refreshShares({ allowDefer = false } = {}) {
       receiveInProgress = true;
       showReceiveOverlay(share.filename);
       startReceiveHealthPing();
+      const abortController = new AbortController();
+      activeReceiveAbort = abortController;
 
       try {
         if (desktopSavePath) {
@@ -1545,42 +1983,71 @@ async function refreshShares({ allowDefer = false } = {}) {
           return;
         }
 
+        const dlRate = createRateTracker();
         const onDl = (ratio, loaded, total) => {
+          dlRate.update(loaded, total);
+          const speedText = dlRate.speedBps > 0 ? ` · ${formatBytes(dlRate.speedBps)}/s` : "";
+          const etaText = dlRate.etaText ? ` · ${dlRate.etaText}` : "";
           if (ratio < 0) {
             receiveProgressBar.classList.add("indeterminate");
-            receiveOverlayStatus.textContent = `Downloaded ${formatBytes(loaded)}...`;
+            receiveOverlayStatus.textContent = `Downloaded ${formatBytes(loaded)}${speedText}`;
             return;
           }
           receiveProgressBar.classList.remove("indeterminate");
           const pct = Math.min(100, Math.round(ratio * 100));
           receiveProgressFill.style.width = `${pct}%`;
-          receiveOverlayStatus.textContent = `Downloaded ${formatBytes(loaded)} / ${formatBytes(total)} (${pct}%)`;
+          receiveOverlayStatus.textContent = `Downloaded ${formatBytes(loaded)} / ${formatBytes(total)} (${pct}%)${speedText}${etaText}`;
         };
 
-        const blob = await downloadFileAdaptive(share, passcode, onDl);
+        // With the FS Access API we stream chunks straight to disk — no
+        // multi-GB Blob in memory. Without it, only small files use the
+        // in-browser path; large ones go through the native download.
+        let sink = null;
         if (browserSaveHandle) {
-          receiveOverlayStatus.textContent = "Writing to selected location...";
-          receiveProgressFill.style.width = "100%";
-          await writeBlobToHandle(browserSaveHandle, blob);
-          receiveOverlayStatus.textContent = `Saved ${share.filename}`;
-          await new Promise((r) => setTimeout(r, 600));
+          sink = createFileHandleSink(browserSaveHandle);
+        } else if (share.size_bytes > BROWSER_BLOB_LIMIT_BYTES) {
+          receiveOverlayStatus.textContent = "Large file — handing off to your browser's downloader...";
+          triggerNativeBrowserDownload(share, passcode);
+          await new Promise((r) => setTimeout(r, 900));
           return;
         }
 
-        receiveOverlayStatus.textContent = "Saving to your device...";
-        receiveProgressFill.style.width = "100%";
-        saveBlob(share.filename, blob);
-        receiveOverlayStatus.textContent = "Done - check your downloads folder.";
-        await new Promise((r) => setTimeout(r, 600));
+        try {
+          const blob = await downloadFileAdaptive(share, passcode, onDl, {
+            sink,
+            signal: abortController.signal,
+          });
+          if (sink || browserSaveHandle) {
+            receiveOverlayStatus.textContent = `Saved ${share.filename}`;
+            await new Promise((r) => setTimeout(r, 600));
+            return;
+          }
+
+          receiveOverlayStatus.textContent = "Saving to your device...";
+          receiveProgressFill.style.width = "100%";
+          saveBlob(share.filename, blob);
+          receiveOverlayStatus.textContent = "Done - check your downloads folder.";
+          await new Promise((r) => setTimeout(r, 600));
+        } finally {
+          // Flush queued writes and release the exclusive FS-Access lock.
+          if (sink) {
+            await sink.close().catch(() => {});
+          }
+        }
       } catch (err) {
-        reportClientLog("ERROR", "Receive operation failed in the client.", {
-          sharer_id: share.sharer_id,
-          filename: share.filename,
-          error: err,
-        });
-        showToast(parseErrorDetail(err), "error");
+        if (err && err.name === "AbortError") {
+          showToast("Download cancelled.", "info");
+        } else {
+          reportClientLog("ERROR", "Receive operation failed in the client.", {
+            sharer_id: share.sharer_id,
+            filename: share.filename,
+            error: err,
+          });
+          showToast(parseErrorDetail(err), "error");
+        }
       } finally {
         receiveInProgress = false;
+        activeReceiveAbort = null;
         stopReceiveHealthPing();
         hideReceiveOverlay();
         btn.disabled = false;
@@ -1599,8 +2066,8 @@ async function refreshShares({ allowDefer = false } = {}) {
 shareForm.addEventListener("submit", async (e) => {
   e.preventDefault();
   const body = new FormData(shareForm);
-  const file = shareFileInput?.files?.[0];
-  if (!file) {
+  const selectedFiles = Array.from(shareFileInput?.files || []);
+  if (!selectedFiles.length) {
     shareStatus.classList.remove("hidden");
     setShareStatus("Choose a file first.", "error");
     return;
@@ -1624,8 +2091,25 @@ shareForm.addEventListener("submit", async (e) => {
     "Uploading to server (this can take a while for very large files)…",
     "info",
   );
+  const uploadAbort = new AbortController();
+  activeUploadAbort = uploadAbort;
 
   try {
+    let file = selectedFiles[0];
+    // Multiple selections ride through the normal pipeline as one zip.
+    if (selectedFiles.length > 1) {
+      const totalBytes = selectedFiles.reduce((sum, f) => sum + f.size, 0);
+      if (totalBytes >= 4 * 1024 * 1024 * 1024) {
+        throw new Error("Multi-file bundles are limited to 4 GiB. Share the largest file alone.");
+      }
+      uploadProgressText.textContent = "Bundling files…";
+      const zipName = selectedFiles.length === 2
+        ? `${stripExt(selectedFiles[0].name)}+${stripExt(selectedFiles[1].name)}.zip`
+        : `${displayName.replace(/[\\/:*?"<>|]/g, "_") || "files"}-${selectedFiles.length}-files.zip`;
+      file = new File([await buildZipBlob(selectedFiles, (msg) => {
+        uploadProgressText.textContent = msg;
+      })], zipName, { type: "application/zip" });
+    }
     const settingsRes = await fetchWithTimeout("/api/settings", { method: "GET" }, DOWNLOAD_TIMEOUT_MS);
     if (!settingsRes.ok) {
       throw await parseResponseError(settingsRes, "Unable to load server settings.");
@@ -1648,18 +2132,25 @@ shareForm.addEventListener("submit", async (e) => {
       updateServerEndpoint(resolveServerUrl(data));
     } else {
       uploadProgressText.textContent = "Measuring upload speed…";
+      const upRate = createRateTracker();
       const shareResult = await uploadFileInChunks(
         file,
         displayName,
         passcode,
         (done, total, chunkBytes, workers) => {
+          const loaded = done * chunkBytes;
+          const totalBytes = total * chunkBytes;
+          upRate.update(loaded, totalBytes);
+          const speedText = upRate.speedBps > 0 ? ` · ${formatBytes(upRate.speedBps)}/s` : "";
+          const etaText = upRate.etaText ? ` · ${upRate.etaText}` : "";
           uploadProgressBar.classList.remove("indeterminate");
           const pct = Math.round((done / total) * 100);
           uploadProgressFill.style.width = `${pct}%`;
-          uploadProgressText.textContent = `Chunks ${done}/${total} (${pct}%) · ${formatBytes(chunkBytes)} each · ${workers} parallel`;
+          uploadProgressText.textContent = `${formatBytes(loaded)} / ${formatBytes(totalBytes)} (${pct}%)${speedText}${etaText} · ${workers} parallel`;
         },
         getChunkMb(),
         getThreads(),
+        uploadAbort.signal,
       );
       localSharerId = shareResult.sharer_id;
       updateServerEndpoint(resolveServerUrl(shareResult));
@@ -1672,6 +2163,15 @@ shareForm.addEventListener("submit", async (e) => {
     stopShareBtn.classList.remove("hidden");
     setShareStatus("Sharing started. You are now sender-only.", "success");
     startShareHeartbeat();
+    // The natural next step is showing the QR so a receiver can scan it —
+    // don't make the sender hunt for the button.
+    if (!qrVisible) {
+      qrVisible = true;
+      qrWrap.classList.remove("hidden");
+      showQrBtn.textContent = "Hide QR";
+      renderQr(serverEndpointUrl);
+    }
+    qrWrap.scrollIntoView({ behavior: "smooth", block: "nearest" });
     uploadProgressBar.classList.remove("indeterminate");
     uploadProgressFill.style.width = "100%";
     uploadProgressText.textContent = "Complete.";
@@ -1681,11 +2181,15 @@ shareForm.addEventListener("submit", async (e) => {
       uploadProgressText.textContent = "";
     }, 800);
   } catch (err) {
-    reportClientLog("ERROR", "Share submission failed in the client.", {
-      filename: file?.name || "",
-      display_name: displayName,
-      error: err,
-    });
+    if (err && err.name === "AbortError") {
+      showToast("Upload cancelled.", "info");
+    } else {
+      reportClientLog("ERROR", "Share submission failed in the client.", {
+        filename: file?.name || "",
+        display_name: displayName,
+        error: err,
+      });
+    }
     const msg =
       err && typeof err === "object" && "detail" in err
         ? err.detail
@@ -1725,8 +2229,13 @@ stopShareBtn.addEventListener("click", async () => {
   setMode("idle");
   await refreshShares();
 });
+window.addEventListener("pagehide", () => {
+  activeUploadAbort = null;
+  activeReceiveAbort = null;
+});
 
 async function initApp() {
+  accessKeyValue = captureAccessKey();
   applyClientVisibility();
   setMode("idle");
   resetShareUi();

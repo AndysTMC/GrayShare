@@ -133,9 +133,27 @@ def _iter_grayshare_processes() -> list[tuple[int, str]]:
 
 
 def terminate_stale_grayshare_processes(log_file: Path | None = None) -> int:
+    """Kill leftover GrayShare instances from previous runs.
+
+    Safety rules:
+    - never kill ourselves
+    - only kill processes whose executable image path matches ours exactly
+      (prevents killing a differently-installed copy or an unrelated exe)
+    - if our own image path cannot be determined, do nothing
+    """
     if os.name != "nt":
         return 0
     current_pid = os.getpid()
+    own_image = ""
+    if getattr(sys, "frozen", False):
+        try:
+            own_image = str(Path(sys.executable).resolve()).lower()
+        except Exception:
+            own_image = ""
+    if not own_image:
+        # Dev runs (python.exe) never match the grayshare.exe name scan anyway;
+        # refusing to act without a verified image path is the safe default.
+        return 0
     kernel32 = ctypes.windll.kernel32
     terminated = 0
     for pid, _exe_name in _iter_grayshare_processes():
@@ -145,10 +163,16 @@ def terminate_stale_grayshare_processes(log_file: Path | None = None) -> int:
         if not handle:
             continue
         try:
+            buf = ctypes.create_unicode_buffer(MAX_PATH * 2)
+            size = ctypes.c_uint32(MAX_PATH * 2)
+            image_path = ""
+            if kernel32.QueryFullProcessImageNameW(handle, 0, buf, ctypes.byref(size)):
+                image_path = str(buf.value or "").lower()
+            if image_path != own_image:
+                continue
             if kernel32.TerminateProcess(handle, 0):
                 terminated += 1
-                if log_file:
-                    append_startup_log(log_file, f"Terminated stale GrayShare.exe process {pid} before startup.")
+                append_startup_log(log_file, f"Terminated stale GrayShare process {pid} before startup.")
         finally:
             kernel32.CloseHandle(handle)
     return terminated
@@ -196,20 +220,31 @@ def build_tls_cert(tmp_dir: Path, host_ip: str):
 
 
 class PortForwarder:
+    """Optional UPnP WAN mapping.
+
+    Disabled by default. Even when enabled via GRAYSHARE_ENABLE_UPNP=1, it is
+    refused unless a passcode requirement is configured — an unauthenticated
+    file server must never be reachable from the public internet.
+    """
+
     def __init__(self, port: int):
         self.port = port
         self.upnp = None
         self.forwarded = False
 
-    def open(self):
+    def open(self, *, enabled: bool = False, passcode_protected: bool = False) -> bool:
+        if not enabled:
+            return False
+        if not passcode_protected:
+            return False
         if miniupnpc is None:
-            return
+            return False
         try:
             upnp = miniupnpc.UPnP()
             upnp.discoverdelay = 500
             found = upnp.discover()
             if found <= 0:
-                return
+                return False
             upnp.selectigd()
             local_ip = upnp.lanaddr
             self.forwarded = bool(
@@ -217,8 +252,10 @@ class PortForwarder:
             )
             if self.forwarded:
                 self.upnp = upnp
+                return True
         except Exception:
             self.forwarded = False
+        return False
 
     def close(self):
         if not self.forwarded or self.upnp is None:
@@ -652,19 +689,31 @@ def parse_args():
 
 
 def run_server_only(args) -> int:
+    # GRAYSHARE_STARTUP_LOG is set only by the desktop parent process; when
+    # absent we're a standalone headless run and skip its log plumbing.
     log_path = os.getenv("GRAYSHARE_STARTUP_LOG", "").strip()
     log_file = Path(log_path) if log_path else None
-    data_dir = Path(os.getenv("APP_DATA_DIR", str(Path.home() / ".grayshare")))
+    data_dir = app_data_dir()
     backend_log_file = data_dir / "backend.log"
     cert_file = args.tls_cert or None
     key_file = args.tls_key or None
     try:
-        append_startup_log(
-            backend_log_file,
-            f"Backend process booting on {args.server_host or '0.0.0.0'}:{int(args.port or 0)}.",
-        )
-        from main import app as fastapi_app
+        if log_file:
+            append_startup_log(
+                backend_log_file,
+                f"Backend process booting on {args.server_host or '0.0.0.0'}:{int(args.port or 0)}.",
+            )
+        from main import app as fastapi_app, ACCESS_KEY, _current_network_info
 
+        # Propagate the actual bound port so network info / QR URLs are right
+        # (main falls back to APP_PORT env, then a hardcoded default).
+        if int(args.port or 0) > 0:
+            os.environ["APP_PORT"] = str(int(args.port))
+        # Headless mode prints the LAN URL + access key so a user (or systemd
+        # journal) can see where to connect without the desktop UI.
+        network = _current_network_info()
+        print(f"GrayShare server running at {network.url}", flush=True)
+        print(f"Access key: {ACCESS_KEY}", flush=True)
         config = uvicorn.Config(
             fastapi_app,
             host=args.server_host or "0.0.0.0",
@@ -699,8 +748,18 @@ def run_server_only(args) -> int:
 
 
 def app_data_dir() -> Path:
-    base = Path(os.getenv("USERPROFILE", str(Path.home())))
-    path = base / ".grayshare"
+    """Per-OS default data dir (mirrors main._default_app_data_dir)."""
+    env_dir = os.getenv("APP_DATA_DIR")
+    if env_dir:
+        path = Path(env_dir)
+    elif os.name == "nt":
+        path = Path(os.getenv("USERPROFILE", str(Path.home()))) / ".grayshare"
+    elif sys.platform == "darwin":
+        path = Path.home() / "Library" / "Application Support" / "GrayShare"
+    else:
+        xdg = os.getenv("XDG_DATA_HOME", "").strip()
+        base = Path(xdg) if xdg else Path.home() / ".local" / "share"
+        path = base / "grayshare"
     path.mkdir(parents=True, exist_ok=True)
     return path
 
@@ -844,6 +903,39 @@ def main():
     if webview is None:
         raise RuntimeError("pywebview is required. Install dependencies and run again.")
 
+    # On Linux, pywebview needs native WebKitGTK bindings that pip cannot
+    # install. Fail with actionable guidance instead of a raw GTK traceback.
+    if sys.platform.startswith("linux") and os.getenv("GRAYSHARE_SKIP_GUI_CHECK", "") not in {"1", "true"}:
+        missing = []
+        try:
+            import gi  # noqa: F401
+        except ImportError:
+            missing.append("python3-gi")
+        if not missing:
+            try:
+                gi.require_version("Gtk", "3.0")
+                gi.require_version("WebKit2", "4.1")
+                from gi.repository import Gtk, WebKit2  # noqa: F401
+            except (ImportError, ValueError):
+                # Some distros ship WebKit2 under version "4.0" instead.
+                try:
+                    gi.require_version("WebKit2", "4.0")
+                    from gi.repository import Gtk, WebKit2  # noqa: F401
+                except (ImportError, ValueError):
+                    missing.append("gir1.2-webkit2-4.1 (or gir1.2-webkit2-4.0)")
+        if missing:
+            message = (
+                "GrayShare desktop mode needs system webview libraries that are "
+                f"missing: {', '.join(missing)}.\n\n"
+                "Install them with:\n"
+                "  sudo apt install python3-gi gir1.2-webkit2-4.1 libgtk-3-0\n"
+                "(or the equivalent for your distribution)\n\n"
+                "Alternatively run GrayShare without a GUI:\n"
+                "  python desktop_app.py --server-only --port 4567"
+            )
+            print(message, file=sys.stderr)
+            raise SystemExit(1)
+
     host_ip = detect_local_ip()
     data_dir = app_data_dir()
     app_config = load_app_config(data_dir)
@@ -876,9 +968,17 @@ def main():
     cleanup_lock = threading.Lock()
     cleanup_done = False
     preferred_gui = None
-    if os.name == "nt":
-        gui_override = os.getenv("GRAYSHARE_WEBVIEW_GUI", "edgechromium").strip().lower()
-        preferred_gui = None if gui_override in {"", "default", "auto"} else gui_override
+    # Per-OS webview backend preference. GRAYSHARE_WEBVIEW_GUI always wins.
+    gui_override = os.getenv("GRAYSHARE_WEBVIEW_GUI", "").strip().lower()
+    if gui_override not in {"", "default", "auto"}:
+        preferred_gui = gui_override
+    elif os.name == "nt":
+        preferred_gui = "edgechromium"
+    elif sys.platform == "darwin":
+        preferred_gui = "cocoa"
+    else:
+        # Linux: let pywebview auto-detect (GTK or QT, whichever is available).
+        preferred_gui = None
 
     def cleanup_server_artifacts(
         current_server: EmbeddedServer | None,
@@ -962,9 +1062,29 @@ def main():
             nonlocal upnp
             local_mdns = MdnsAnnouncer(host_ip, active_port)
             local_upnp = PortForwarder(active_port)
+            # UPnP WAN mapping is opt-in (GRAYSHARE_ENABLE_UPNP=1) and is
+            # refused entirely unless a passcode is required for shares.
+            upnp_enabled = os.getenv("GRAYSHARE_ENABLE_UPNP", "").strip().lower() in {"1", "true", "yes"}
+            passcode_protected = os.getenv("GRAYSHARE_REQUIRE_PASSCODE", "").strip().lower() in {"1", "true", "yes"}
+            if upnp_enabled and not passcode_protected:
+                append_startup_log(
+                    log_file,
+                    "UPnP requested but GRAYSHARE_REQUIRE_PASSCODE is not set. "
+                    "Refusing to expose the server to the WAN without a passcode.",
+                    level="WARN",
+                )
+                upnp_enabled = False
             try:
                 local_mdns.start()
-                local_upnp.open()
+                forwarded = local_upnp.open(
+                    enabled=upnp_enabled, passcode_protected=passcode_protected
+                )
+                if forwarded:
+                    append_startup_log(
+                        log_file,
+                        f"UPnP port mapping active on port {active_port} (passcode-protected).",
+                        level="WARN",
+                    )
                 mdns = local_mdns
                 upnp = local_upnp
             except Exception:

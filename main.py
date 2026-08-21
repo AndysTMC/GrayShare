@@ -43,10 +43,28 @@ RESOURCE_DIR = (
     if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS")
     else BASE_DIR
 )
+
+
+def _default_app_data_dir() -> Path:
+    """Per-OS default data dir.
+
+    - Windows: %USERPROFILE%\\.grayshare (unchanged from v1)
+    - macOS:   ~/Library/Application Support/GrayShare
+    - Linux:   $XDG_DATA_HOME/grayshare (default ~/.local/share/grayshare)
+    """
+    if os.name == "nt":
+        return Path(os.getenv("USERPROFILE", str(Path.home()))) / ".grayshare"
+    if sys.platform == "darwin":
+        return Path.home() / "Library" / "Application Support" / "GrayShare"
+    xdg = os.getenv("XDG_DATA_HOME", "").strip()
+    base = Path(xdg) if xdg else Path.home() / ".local" / "share"
+    return base / "grayshare"
+
+
 APP_DATA_DIR = (
     Path(os.getenv("APP_DATA_DIR"))
     if os.getenv("APP_DATA_DIR")
-    else Path(os.getenv("USERPROFILE", str(Path.home()))) / ".grayshare"
+    else _default_app_data_dir()
 )
 APP_DATA_DIR.mkdir(parents=True, exist_ok=True)
 INBOX_DIR = APP_DATA_DIR / "inbox"
@@ -63,16 +81,19 @@ STREAM_CHUNK_BYTES = int(os.getenv("FILE_STREAM_CHUNK_BYTES", str(1024 * 1024)))
 # Chunked transfer (parallel upload / parallel download)
 CHUNK_MIN_BYTES = int(os.getenv("CHUNK_MIN_BYTES", str(256 * 1024)))  # 256 KiB
 CHUNK_MAX_BYTES = int(os.getenv("CHUNK_MAX_BYTES", str(256 * 1024 * 1024)))  # 256 MiB
-SHARE_SESSION_STALE_SECONDS = int(os.getenv("SHARE_SESSION_STALE_SECONDS", "15"))
+SHARE_SESSION_STALE_SECONDS = int(os.getenv("SHARE_SESSION_STALE_SECONDS", "45"))
 PENDING_UPLOAD_STALE_SECONDS = int(os.getenv("PENDING_UPLOAD_STALE_SECONDS", "1800"))
 
-ACTIVITY_MAX = 100
+ACTIVITY_MAX = 200
 activity_log: deque = deque(maxlen=ACTIVITY_MAX)
+# Persistent transfer history: JSONL append per event, survives restarts.
+HISTORY_FILE = APP_DATA_DIR / "history.jsonl"
+HISTORY_MAX_LINES = 500
+history_lock = threading.Lock()
 DEFAULT_CLIENT_SETTINGS = {
     "display_name": "",
     "chunk_mb": 0,
     "threads": 0,
-    "refresh_sec": 5,
     "theme": "light",
 }
 DEFAULT_APP_CONFIG = {
@@ -99,16 +120,46 @@ def append_backend_log(message: str, *, level: str = "INFO") -> None:
         pass
 
 
+def _append_history_sync(entry: Dict[str, Any]) -> None:
+    try:
+        with history_lock:
+            with HISTORY_FILE.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+
+def _load_history_sync() -> List[Dict[str, Any]]:
+    """Load persisted history (oldest last), trimmed to ACTIVITY_MAX."""
+    if not HISTORY_FILE.is_file():
+        return []
+    entries: List[Dict[str, Any]] = []
+    try:
+        with HISTORY_FILE.open("r", encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entries.append(json.loads(line))
+                except Exception:
+                    continue
+    except Exception:
+        return []
+    return entries[-ACTIVITY_MAX:]
+
+
 def log_activity(kind: str, message: str, meta: Optional[Dict[str, Any]] = None) -> None:
-    activity_log.appendleft(
-        {
-            "id": secrets.token_hex(8),
-            "ts": datetime.now(timezone.utc).isoformat(),
-            "kind": kind,
-            "message": message,
-            "meta": meta or {},
-        }
-    )
+    entry = {
+        "id": secrets.token_hex(8),
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "kind": kind,
+        "message": message,
+        "meta": meta or {},
+    }
+    activity_log.appendleft(entry)
+    publish_event("activity", entry)
+    _append_history_sync(entry)
     meta_text = ""
     if meta:
         try:
@@ -116,6 +167,49 @@ def log_activity(kind: str, message: str, meta: Optional[Dict[str, Any]] = None)
         except Exception:
             meta_text = f" | {meta!r}"
     append_backend_log(f"[activity:{kind}] {message}{meta_text}")
+
+
+# --- Server-Sent Events bus -------------------------------------------------
+# Clients subscribe to /api/events with the access key and receive instant
+# notifications for share starts/stops, replacing the fixed 5s polling loop.
+# Fallback polling stays in place for clients/proxies where SSE is unavailable.
+event_queues: Set[asyncio.Queue] = set()
+event_loop: Optional[asyncio.AbstractEventLoop] = None
+
+
+def publish_event(event_type: str, payload: Dict[str, Any]) -> None:
+    """Fan out an event to all SSE subscribers (safe to call from threads)."""
+    if not event_queues:
+        return
+    message = {"type": event_type, "payload": payload}
+    for queue in list(event_queues):
+        try:
+            loop = event_loop or asyncio.get_event_loop()
+            loop.call_soon_threadsafe(queue.put_nowait, message)
+        except RuntimeError:
+            pass
+
+
+async def event_stream(request: Request):
+    """SSE generator; yields share/activity events until client disconnects."""
+    global event_loop
+    event_loop = asyncio.get_running_loop()
+    queue: asyncio.Queue = asyncio.Queue(maxsize=64)
+    event_queues.add(queue)
+    try:
+        # Initial hello so the client knows the stream is live.
+        yield f"data: {json.dumps({'type': 'hello', 'payload': {'ts': datetime.now(timezone.utc).isoformat()}})}\n\n"
+        while True:
+            if await request.is_disconnected():
+                break
+            try:
+                message = await asyncio.wait_for(queue.get(), timeout=15.0)
+                yield f"data: {json.dumps(message)}\n\n"
+            except asyncio.TimeoutError:
+                # Comment keepalive keeps proxies from closing idle streams.
+                yield ": keepalive\n\n"
+    finally:
+        event_queues.discard(queue)
 
 
 def log_backend_event(
@@ -170,11 +264,12 @@ def _load_client_settings_sync() -> ClientSettings:
     else:
         raw = DEFAULT_CLIENT_SETTINGS
     settings = _normalize_client_settings(raw)
-    SETTINGS_FILE.write_text(
-        json.dumps(settings.model_dump(), indent=2),
-        encoding="utf-8",
-    )
-    append_backend_log(f"Client settings loaded from {SETTINGS_FILE}.")
+    serialized = json.dumps(settings.model_dump(), indent=2)
+    # Write back only when normalization actually changed the stored value,
+    # so read paths don't dirty the disk on every request.
+    if not SETTINGS_FILE.is_file() or SETTINGS_FILE.read_text(encoding="utf-8") != serialized:
+        SETTINGS_FILE.write_text(serialized, encoding="utf-8")
+        append_backend_log(f"Client settings loaded from {SETTINGS_FILE}.")
     return settings
 
 
@@ -205,11 +300,12 @@ def _load_app_config_sync() -> AppConfig:
     else:
         raw = DEFAULT_APP_CONFIG
     config = _normalize_app_config(raw)
-    APP_CONFIG_FILE.write_text(
-        json.dumps(config.model_dump(), indent=2),
-        encoding="utf-8",
-    )
-    append_backend_log(f"App config loaded from {APP_CONFIG_FILE}. port={config.port}")
+    serialized = json.dumps(config.model_dump(), indent=2)
+    # Write back only when normalization changed the stored value (avoids disk
+    # thrash on every read).
+    if not APP_CONFIG_FILE.is_file() or APP_CONFIG_FILE.read_text(encoding="utf-8") != serialized:
+        APP_CONFIG_FILE.write_text(serialized, encoding="utf-8")
+        append_backend_log(f"App config loaded from {APP_CONFIG_FILE}. port={config.port}")
     return config
 
 
@@ -298,6 +394,12 @@ class SharingUser(BaseModel):
     size_bytes: int
 
 
+# Capability key: LAN clients must present this (via ?k= on the app URL) to see
+# active shares. Distributed through the QR code / network URL; regenerated on
+# every backend boot.
+ACCESS_KEY = secrets.token_urlsafe(12)
+
+
 class InboxFile(BaseModel):
     name: str
     size_bytes: int
@@ -377,13 +479,13 @@ class NetworkInfo(BaseModel):
     port: int
     endpoint: str
     url: str
+    access_key: str = ""
 
 
 class ClientSettings(BaseModel):
     display_name: str = Field(default="", max_length=40)
     chunk_mb: int = Field(default=0, ge=0, le=256)
     threads: int = Field(default=0, ge=0, le=16)
-    refresh_sec: int = Field(default=5, ge=2, le=60)
     theme: str = Field(default="light")
 
 
@@ -439,9 +541,10 @@ class PendingChunkedUpload:
     chunk_size: int
     total_chunks: int
     file_token: str
-    parts_dir: Path
+    # Final file is preallocated at init; chunks are written in place at their
+    # offset. No part files, no merge phase.
+    target_path: Path
     received: Set[int] = field(default_factory=set)
-    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     updated_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
@@ -568,6 +671,9 @@ app.mount("/static", StaticFiles(directory=str(RESOURCE_DIR / "static")), name="
 storage = build_storage()
 share_sessions: Dict[str, ShareSession] = {}
 pending_chunked: Dict[str, PendingChunkedUpload] = {}
+# Restore persisted transfer history so the History view survives restarts.
+for _entry in reversed(_load_history_sync()):
+    activity_log.appendleft(_entry)
 append_backend_log(
     "Backend initialized. "
     f"pid={os.getpid()} "
@@ -642,47 +748,55 @@ def _range_iterator_for_session(session: ShareSession, offset: int, length: int)
         yield from _read_range_local(path, offset, length)
 
 
-def _write_chunk_part_sync(dest: Path, upload_file) -> int:
-    with dest.open("wb") as out:
-        shutil.copyfileobj(upload_file, out, length=COPY_BUFFER_BYTES)
-    return dest.stat().st_size
+def _write_chunk_at_offset_sync(target: Path, offset: int, upload_file, expected_size: int) -> int:
+    """Write one chunk directly into the preallocated file at its offset.
+
+    Each request opens its own handle and writes to a disjoint region, so
+    concurrent chunk uploads need no shared lock.
+    """
+    written = 0
+    with target.open("r+b") as out:
+        out.seek(offset)
+        while True:
+            chunk = upload_file.read(COPY_BUFFER_BYTES)
+            if not chunk:
+                break
+            out.write(chunk)
+            written += len(chunk)
+    return written
 
 
-def _merge_pending_parts_sync(parts_dir: Path, total_chunks: int, out_path: Path) -> None:
-    with out_path.open("wb") as out:
-        for i in range(total_chunks):
-            part = parts_dir / f"{i:06d}"
-            with part.open("rb") as inp:
-                shutil.copyfileobj(inp, out, length=COPY_BUFFER_BYTES)
-            part.unlink()
-    parts_dir.rmdir()
+def _preallocate_file_sync(path: Path, size: int) -> None:
+    with path.open("wb") as f:
+        if size > 0:
+            f.truncate(size)
 
 
 async def _finalize_chunked_upload(pending: PendingChunkedUpload) -> ShareSession:
     safe_name = Path(pending.filename).name or "file.bin"
-    final_path = INBOX_DIR / f"{pending.file_token}_{safe_name}"
-    await asyncio.to_thread(
-        _merge_pending_parts_sync, pending.parts_dir, pending.total_chunks, final_path
-    )
+    final_path = pending.target_path
     size = await asyncio.to_thread(lambda: final_path.stat().st_size)
-    if size != pending.total_size:
+    if size != pending.total_size or len(pending.received) != pending.total_chunks:
         await asyncio.to_thread(final_path.unlink, missing_ok=True)
         log_backend_event(
             "WARN",
             "transfer",
-            "Merged chunked upload size mismatch.",
+            "Chunked upload finalize rejected.",
             meta={
                 "sharer_id": pending.sharer_id,
                 "filename": safe_name,
                 "expected_size": pending.total_size,
                 "actual_size": size,
+                "received_chunks": len(pending.received),
+                "total_chunks": pending.total_chunks,
             },
         )
         raise HTTPException(
             status_code=400,
             detail=(
-                f"Merged file size mismatch: expected {pending.total_size} bytes, "
-                f"got {size}."
+                f"Upload incomplete or size mismatch: expected {pending.total_size} bytes "
+                f"and {pending.total_chunks} chunks, got {size} bytes and "
+                f"{len(pending.received)} chunks."
             ),
         )
     session = ShareSession(
@@ -712,38 +826,6 @@ async def _finalize_chunked_upload(pending: PendingChunkedUpload) -> ShareSessio
     return session
 
 
-def _iter_local_file_chunks(path: str, chunk_size: int) -> Iterator[bytes]:
-    with open(path, "rb") as f:
-        while True:
-            chunk = f.read(chunk_size)
-            if not chunk:
-                break
-            # Never yield b"" — some asyncio/uvicorn paths assert on empty writes (Py3.13+).
-            if chunk:
-                yield chunk
-
-
-def _iter_smb_file_chunks(uri: str, chunk_size: int) -> Iterator[bytes]:
-    f = smbclient.open_file(uri, mode="rb")
-    try:
-        while True:
-            chunk = f.read(chunk_size)
-            if not chunk:
-                break
-            if chunk:
-                yield chunk
-    finally:
-        f.close()
-
-
-def file_byte_iterator(storage_uri: str, chunk_size: int) -> Iterator[bytes]:
-    """Stream file in chunks (never loads whole file into RAM)."""
-    if isinstance(storage, SMBStorage):
-        yield from _iter_smb_file_chunks(storage_uri, chunk_size)
-    else:
-        yield from _iter_local_file_chunks(storage_uri, chunk_size)
-
-
 def _resolved_path_under_inbox(storage_uri: str) -> Path:
     """Ensure receive only serves files from our inbox (local mode)."""
     try:
@@ -769,7 +851,13 @@ def _copy_session_to_local_path_sync(session: ShareSession, target_path: Path) -
             return _copy_reader_to_path_sync(inp, target_path)
     src_path = _resolved_path_under_inbox(session.storage_uri)
     target_path.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copyfile(src_path, target_path)
+    # The share is removed from the inbox once every receiver is done, so the
+    # host copy is the last consumer: a same-volume rename is instant and
+    # correct here. Fall back to a full copy across volumes.
+    try:
+        os.replace(src_path, target_path)
+    except OSError:
+        shutil.copyfile(src_path, target_path)
     return target_path.stat().st_size
 
 
@@ -783,11 +871,62 @@ def _is_loopback_request(request: Request) -> bool:
         return False
 
 
-def _get_active_session(sharer_id: str, passcode: Optional[str]) -> ShareSession:
+def _is_authorized_request(request: Request, k: str = "") -> bool:
+    """Loopback clients are trusted; LAN clients must present the access key.
+
+    Used by endpoints that expose host metadata or admin operations.
+    """
+    if _is_loopback_request(request):
+        return True
+    return secrets.compare_digest(str(k or ""), ACCESS_KEY)
+
+
+def _redact_network_info(info: NetworkInfo) -> NetworkInfo:
+    """LAN-safe variant without the capability key or tokenized URL."""
+    return NetworkInfo(
+        ip=info.ip,
+        port=info.port,
+        endpoint=info.endpoint,
+        url=f'{os.getenv("APP_SCHEME", "http").lower().strip() or "http"}://{info.endpoint}/',
+        access_key="",
+    )
+
+
+def _extract_passcode(
+    request: Request | None = None,
+    query_value: Optional[str] = None,
+    form_value: Optional[str] = None,
+) -> Optional[str]:
+    """Prefer the X-GrayShare-Passcode header; fall back to query/form.
+
+    Header transport keeps passcodes out of URLs (browser history, server logs).
+    """
+    if request is not None:
+        header_value = request.headers.get("x-grayshare-passcode")
+        if header_value:
+            return header_value
+    if form_value:
+        return form_value
+    return query_value
+
+
+def _passcode_matches(provided: Optional[str], expected: Optional[str]) -> bool:
+    if not expected:
+        return True
+    if not provided:
+        return False
+    return secrets.compare_digest(provided.strip(), expected)
+
+
+def _get_active_session(
+    sharer_id: str,
+    passcode: Optional[str],
+    request: Request | None = None,
+) -> ShareSession:
     session = share_sessions.get(sharer_id)
     if not session or not session.active:
         raise HTTPException(status_code=404, detail="Share session not found.")
-    if session.passcode and passcode != session.passcode:
+    if not _passcode_matches(passcode, session.passcode):
         raise HTTPException(status_code=403, detail="Invalid passcode.")
     return session
 
@@ -821,11 +960,12 @@ async def _remove_share_session(
         raise HTTPException(status_code=404, detail="Share session not found.")
     session.active = False
     deleted_file = await storage.delete_file(session.storage_uri)
-    message = (
-        f'{session.display_name} stopped sharing "{session.filename}"'
-        if reason == "manual"
-        else f'{session.display_name} is no longer sharing "{session.filename}"'
-    )
+    if reason == "manual":
+        message = f'{session.display_name} stopped sharing "{session.filename}"'
+    elif reason == "saved-locally":
+        message = f'Saved "{session.filename}" — share ended'
+    else:
+        message = f'{session.display_name} is no longer sharing "{session.filename}"'
     log_activity(
         "share_stop",
         message,
@@ -869,7 +1009,9 @@ async def _prune_stale_pending_uploads() -> None:
     ]
     for sharer_id, pending in stale_items:
         pending_chunked.pop(sharer_id, None)
-        await asyncio.to_thread(shutil.rmtree, pending.parts_dir, True)
+        await asyncio.to_thread(
+            lambda p=pending.target_path: p.unlink(missing_ok=True)
+        )
         log_backend_event(
             "WARN",
             "transfer",
@@ -972,12 +1114,30 @@ def _parse_byte_range(range_header: str | None, size: int) -> tuple[int, int] | 
     return start, min(end, size - 1)
 
 
+def _content_disposition(filename: str, *, attachment: bool = True) -> str:
+    """RFC 6266/5987 Content-Disposition value, safe for quotes/non-ASCII."""
+    safe = (filename or "file.bin").replace("\\", "_").replace('"', "_")
+    safe = safe.replace("\r", " ").replace("\n", " ")
+    try:
+        safe.encode("ascii")
+        return f'{"attachment" if attachment else "inline"}; filename="{safe}"'
+    except UnicodeEncodeError:
+        pass
+    from urllib.parse import quote
+
+    quoted = quote(safe, safe="")
+    return (
+        f'{"attachment" if attachment else "inline"}; filename="{safe.encode("ascii", "ignore").decode() or "file"}"; '
+        f"filename*=UTF-8''{quoted}"
+    )
+
+
 def _build_receive_response(session: ShareSession, request: Request):
     total_size = max(0, int(session.size_bytes or 0))
     media_type = session.content_type or "application/octet-stream"
     headers = {
         "Accept-Ranges": "bytes",
-        "Content-Disposition": f'attachment; filename="{session.filename}"',
+        "Content-Disposition": _content_disposition(session.filename),
     }
     range_spec = _parse_byte_range(request.headers.get("range"), total_size)
 
@@ -1035,13 +1195,15 @@ def _current_network_info() -> NetworkInfo:
         ip=ip,
         port=port,
         endpoint=endpoint,
-        url=f"{scheme}://{endpoint}/",
+        url=f"{scheme}://{endpoint}/?k={ACCESS_KEY}",
+        access_key=ACCESS_KEY,
     )
 
 
 @app.get("/", response_class=HTMLResponse)
 async def home(request: Request):
-    return templates.TemplateResponse("index.html", {"request": request})
+    # Newer Starlette requires request as a keyword argument.
+    return templates.TemplateResponse(request=request, name="index.html")
 
 
 @app.get("/manifest.webmanifest")
@@ -1061,10 +1223,34 @@ async def service_worker():
     )
 
 
+@app.get("/api/events")
+async def sse_events(request: Request, k: str = Query(default="")):
+    """Server-Sent Events stream: instant share/activity notifications.
+
+    Gated by the same access key as /api/shares — event payloads carry
+    filenames and sharer names.
+    """
+    if not secrets.compare_digest(str(k or ""), ACCESS_KEY):
+        raise HTTPException(status_code=403, detail="Invalid or missing access key.")
+    return StreamingResponse(
+        event_stream(request),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+        },
+    )
+
+
 @app.get("/api/shares", response_model=List[SharingUser])
-async def list_shares():
+async def list_shares(k: str = Query(default="")):
     await _prune_stale_share_sessions()
     await _prune_stale_pending_uploads()
+    # Share metadata (names, filenames, sizes) is only revealed to clients that
+    # present the access key distributed via the QR code / network URL.
+    if not secrets.compare_digest(str(k or ""), ACCESS_KEY):
+        raise HTTPException(status_code=403, detail="Invalid or missing access key.")
     return [
         SharingUser(
             sharer_id=session.sharer_id,
@@ -1096,37 +1282,52 @@ def _list_inbox_files_sync() -> List[InboxFile]:
 
 
 @app.get("/api/inbox", response_model=List[InboxFile])
-async def list_inbox():
+async def list_inbox(request: Request, k: str = Query(default="")):
     """Files stored under the server `inbox/` folder (local storage mode uploads)."""
+    if not _is_authorized_request(request, k):
+        raise HTTPException(status_code=403, detail="Invalid or missing access key.")
     return await asyncio.to_thread(_list_inbox_files_sync)
 
 
 @app.get("/api/activity", response_model=List[ActivityEntry])
-async def list_activity():
-    """Recent server-side transfer events (in-memory; resets on restart)."""
+async def list_activity(request: Request, k: str = Query(default="")):
+    """Recent transfer events (persisted to history.jsonl across restarts)."""
+    if not _is_authorized_request(request, k):
+        raise HTTPException(status_code=403, detail="Invalid or missing access key.")
     return list(activity_log)
 
 
 @app.get("/api/settings", response_model=ServerSettings)
-async def get_server_settings():
-    """Non-secret server configuration for the settings UI."""
+async def get_server_settings(request: Request, k: str = Query(default="")):
+    """Non-secret server configuration for the settings UI.
+
+    Host filesystem paths are redacted for LAN clients; loopback gets full
+    detail (the desktop Settings page shows the data folder).
+    """
+    authorized = _is_authorized_request(request, k)
     return ServerSettings(
         storage_mode=os.getenv("FILES_STORAGE_MODE", "local").lower().strip(),
         copy_buffer_bytes=COPY_BUFFER_BYTES,
         stream_chunk_bytes=STREAM_CHUNK_BYTES,
-        inbox_path=str(INBOX_DIR.resolve()),
-        app_data_path=str(APP_DATA_DIR.resolve()),
+        inbox_path=str(INBOX_DIR.resolve()) if authorized else "",
+        app_data_path=str(APP_DATA_DIR.resolve()) if authorized else "",
         smb_active=isinstance(storage, SMBStorage),
     )
 
 
 @app.get("/api/settings/client", response_model=ClientSettings)
-async def get_client_settings():
+async def get_client_settings(request: Request, k: str = Query(default="")):
+    if not _is_authorized_request(request, k):
+        raise HTTPException(status_code=403, detail="Invalid or missing access key.")
     return await asyncio.to_thread(_load_client_settings_sync)
 
 
 @app.put("/api/settings/client", response_model=ClientSettings)
-async def update_client_settings(settings: ClientSettings):
+async def update_client_settings(settings: ClientSettings, request: Request):
+    # The host's settings.json is a local resource; LAN clients keep their
+    # own copy in localStorage and must not mutate the host's file.
+    if not _is_loopback_request(request):
+        raise HTTPException(status_code=403, detail="Host settings are only available locally.")
     return await asyncio.to_thread(_save_client_settings_sync, settings)
 
 
@@ -1207,7 +1408,12 @@ async def save_and_close_desktop_app(
 
 
 @app.post("/api/data/clear", response_model=DataClearResult)
-async def clear_app_data():
+async def clear_app_data(request: Request):
+    # Destructive host operation — loopback only. A LAN device (or a malicious
+    # webpage firing cross-origin POSTs) must never be able to wipe the host's
+    # inbox and history.
+    if not _is_loopback_request(request):
+        raise HTTPException(status_code=403, detail="Clear data is only available locally.")
     for session in list(share_sessions.values()):
         session.active = False
         try:
@@ -1218,6 +1424,9 @@ async def clear_app_data():
     pending_chunked.clear()
     activity_log.clear()
     deleted_items, preserved_items, skipped = await asyncio.to_thread(_clear_app_data_sync)
+    # history.jsonl lives under APP_DATA_DIR so _clear_app_data_sync already
+    # removed it; make sure a fresh empty file exists for future appends.
+    await asyncio.to_thread(lambda: HISTORY_FILE.touch(exist_ok=True))
     if SETTINGS_FILE.exists():
         skipped.append("settings.json preserved")
     if APP_CONFIG_FILE.exists():
@@ -1237,8 +1446,17 @@ async def health():
 
 
 @app.get("/api/network/info", response_model=NetworkInfo)
-async def network_info():
-    return await asyncio.to_thread(_current_network_info)
+async def network_info(request: Request, k: str = Query(default="")):
+    """Connection info for the UI.
+
+    The access key / tokenized URL is only revealed to loopback clients or
+    callers already presenting a valid key — otherwise this endpoint would
+    defeat the capability gating on /api/shares and /api/events.
+    """
+    info = await asyncio.to_thread(_current_network_info)
+    if _is_authorized_request(request, k):
+        return info
+    return _redact_network_info(info)
 
 
 @app.post("/api/telemetry/upload-probe")
@@ -1293,8 +1511,8 @@ async def share_init(body: ShareInitBody):
         total_chunks = (body.total_size + body.chunk_size - 1) // body.chunk_size
     sharer_id = secrets.token_urlsafe(10)
     file_token = secrets.token_urlsafe(12)
-    parts_dir = INBOX_DIR / f".pending_{file_token}"
-    parts_dir.mkdir(parents=True, exist_ok=True)
+    target_path = INBOX_DIR / f"{file_token}_{safe_name}"
+    await asyncio.to_thread(_preallocate_file_sync, target_path, body.total_size)
     pending = PendingChunkedUpload(
         sharer_id=sharer_id,
         display_name=display_name,
@@ -1305,7 +1523,7 @@ async def share_init(body: ShareInitBody):
         chunk_size=body.chunk_size,
         total_chunks=total_chunks,
         file_token=file_token,
-        parts_dir=parts_dir,
+        target_path=target_path,
     )
     pending_chunked[sharer_id] = pending
     log_backend_event(
@@ -1396,33 +1614,34 @@ async def share_upload_chunk(
         )
 
     complete = False
-    async with pending.lock:
-        part_path = pending.parts_dir / f"{chunk_index:06d}"
-        try:
-            size = await asyncio.to_thread(_write_chunk_part_sync, part_path, file.file)
-        finally:
-            await file.close()
-        if size != expected:
-            if part_path.exists():
-                part_path.unlink(missing_ok=True)
-            pending.received.discard(chunk_index)
-            log_backend_event(
-                "WARN",
-                "transfer",
-                "Chunk upload rejected because its size did not match expectation.",
-                meta={
-                    "sharer_id": sharer_id,
-                    "chunk_index": chunk_index,
-                    "expected_size": expected,
-                    "actual_size": size,
-                },
-            )
-            raise HTTPException(
-                status_code=400,
-                detail=f"Chunk size mismatch: expected {expected} bytes, got {size}.",
-            )
-        pending.received.add(chunk_index)
-        pending.updated_at = datetime.now(timezone.utc)
+    # Each chunk writes to a disjoint region of the preallocated file via its
+    # own file handle, so concurrent uploads need no shared lock.
+    offset = chunk_index * pending.chunk_size
+    try:
+        written = await asyncio.to_thread(
+            _write_chunk_at_offset_sync, pending.target_path, offset, file.file, expected
+        )
+    finally:
+        await file.close()
+    if written != expected:
+        pending.received.discard(chunk_index)
+        log_backend_event(
+            "WARN",
+            "transfer",
+            "Chunk upload rejected because its size did not match expectation.",
+            meta={
+                "sharer_id": sharer_id,
+                "chunk_index": chunk_index,
+                "expected_size": expected,
+                "actual_size": written,
+            },
+        )
+        raise HTTPException(
+            status_code=400,
+            detail=f"Chunk size mismatch: expected {expected} bytes, got {written}.",
+        )
+    pending.received.add(chunk_index)
+    pending.updated_at = datetime.now(timezone.utc)
 
     return {"ok": True, "chunk_index": chunk_index, "complete": False}
 
@@ -1430,10 +1649,13 @@ async def share_upload_chunk(
 @app.get("/api/receive/{sharer_id}/info", response_model=ReceiveInfo)
 async def receive_info(
     sharer_id: str,
+    request: Request,
     passcode: Optional[str] = Query(default=None),
 ):
     await _prune_stale_share_sessions()
-    session = _get_active_session(sharer_id, passcode)
+    session = _get_active_session(
+        sharer_id, _extract_passcode(request, query_value=passcode), request=request
+    )
     cs, cc = _chunk_spec(session)
     log_backend_event(
         "INFO",
@@ -1460,10 +1682,13 @@ async def receive_info(
 async def receive_chunk_get(
     sharer_id: str,
     chunk_index: int,
+    request: Request,
     passcode: Optional[str] = Query(default=None),
 ):
     await _prune_stale_share_sessions()
-    session = _get_active_session(sharer_id, passcode)
+    session = _get_active_session(
+        sharer_id, _extract_passcode(request, query_value=passcode), request=request
+    )
 
     cs, cc = _chunk_spec(session)
     if chunk_index < 0 or chunk_index >= cc:
@@ -1498,7 +1723,7 @@ async def receive_chunk_get(
         )
 
     headers = {
-        "Content-Disposition": f'attachment; filename="{session.filename}.part{chunk_index}"',
+        "Content-Disposition": _content_disposition(f"{session.filename}.part{chunk_index}"),
         "Content-Length": str(length),
     }
     return StreamingResponse(
@@ -1585,7 +1810,9 @@ async def receive_file(
     passcode: Optional[str] = Form(default=None),
 ):
     await _prune_stale_share_sessions()
-    session = _get_active_session(sharer_id, passcode)
+    session = _get_active_session(
+        sharer_id, _extract_passcode(request, form_value=passcode), request=request
+    )
     log_backend_event(
         "INFO",
         "transfer",
@@ -1613,7 +1840,9 @@ async def receive_file_download(
     passcode: Optional[str] = Query(default=None),
 ):
     await _prune_stale_share_sessions()
-    session = _get_active_session(sharer_id, passcode)
+    session = _get_active_session(
+        sharer_id, _extract_passcode(request, query_value=passcode), request=request
+    )
     log_backend_event(
         "INFO",
         "transfer",
@@ -1649,7 +1878,7 @@ async def receive_file_save_local(
     session = share_sessions.get(sharer_id)
     if not session or not session.active:
         raise HTTPException(status_code=404, detail="Share session not found.")
-    if session.passcode and payload.passcode != session.passcode:
+    if not _passcode_matches(_extract_passcode(request, form_value=payload.passcode), session.passcode):
         raise HTTPException(status_code=403, detail="Invalid passcode.")
 
     target_path = Path(payload.target_path).expanduser()
@@ -1682,4 +1911,9 @@ async def receive_file_save_local(
             "size_bytes": size,
         },
     )
+    # The desktop save consumed the file (moved out of the inbox on the same
+    # volume), so end the share session cleanly. missing_ok guards the
+    # cross-volume fallback where the inbox copy still exists — the sender can
+    # keep sharing in that case.
+    await _remove_share_session(sharer_id, reason="saved-locally", missing_ok=True)
     return LocalSaveResult(saved_path=str(target_path), size_bytes=size)

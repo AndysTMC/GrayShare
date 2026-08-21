@@ -48,6 +48,11 @@ a = Analysis(
         "uvicorn.protocols.http.auto",
         "uvicorn.protocols.websockets.auto",
         "jinja2",
+        # FastAPI resolves python-multipart lazily at runtime; without this
+        # entry multipart form parsing (all uploads) breaks in the frozen exe.
+        "multipart",
+        # Optional SMB storage backend (try/except import in main.py).
+        "smbclient",
         "webview",
         "webview.platforms.winforms",
         "webview.platforms.edgechromium",

@@ -1,153 +1,47 @@
 # GrayShare
 
-GrayShare is a Windows LAN file-sharing app with a packaged desktop executable and a browser client for other devices on the same network.
+GrayShare is a LAN file-sharing app: a desktop host (Windows, macOS, or Linux) with a zero-install browser client for other devices on the same network. A headless server mode is also available for machines without a display.
 
 <p align="center">
-    <img src="./images/GrayShareImg.jpg" alt="Gray Share Demo Image" width="500"/>
+    <img src="./images/GrayShareImg.png" alt="Gray Share Demo Image" width="500"/>
 </p>
 
-## What It Does
+Send and receive files on the LAN, including multi-file zip bundles, a QR code with a per-launch access key, optional passcodes, live share updates, Range-aware downloads, and transfer history on disk. How it fits together: [docs/architecture.md](docs/architecture.md). Binding choices: [docs/decisions/_index.md](docs/decisions/_index.md). Agent protocol: [AGENTS.md](AGENTS.md).
 
-- share files from one device to others on the LAN
-- show a QR code for quick mobile access
-- support optional passcodes
-- support HTTP Range requests on browser downloads for resume/seek-friendly transfers
-- save desktop data under `%USERPROFILE%\.grayshare`
-- build both a portable exe and an NSIS installer
+## Run from source
 
-## How It Works
-
-- `GrayShare.exe` opens a pywebview desktop window
-- Windows desktop launches pywebview with the Edge/WebView2 backend by default
-- the desktop app starts the FastAPI backend as a separate child process
-- the desktop UI uses loopback (`127.0.0.1`)
-- phones and other devices use the LAN URL shown in the app
-
-Desktop and backend logs are written per launch to:
-
-- `%USERPROFILE%\.grayshare\startup.log`
-- `%USERPROFILE%\.grayshare\backend.log`
-
-## Data Location
-
-GrayShare stores runtime data in:
-
-```text
-%USERPROFILE%\.grayshare
-```
-
-Important files and folders:
-
-- `inbox`
-- `webview`
-- `settings.json`
-- `app_config.json`
-- `startup.log`
-- `backend.log`
-
-## Settings
-
-Settings behave differently depending on how the app is opened:
-
-- desktop / loopback access
-  Settings are stored in `%USERPROFILE%\.grayshare\settings.json`
-- LAN browser access
-  Settings are stored in that browser's `localStorage`
-
-The preferred desktop port is stored in `%USERPROFILE%\.grayshare\app_config.json`.
-If that port is busy on launch, GrayShare falls back to a free temporary port for that run.
-
-## Storage Modes
-
-GrayShare supports:
-
-- `local` (default)
-- `smb`
-
-`smb` mode is only the storage backend. Device-to-device transfer still happens over GrayShare's HTTP server.
-
-Example SMB environment:
-
-```powershell
-$env:FILES_STORAGE_MODE = "smb"
-$env:SMB_SERVER = "YOUR_SERVER"
-$env:SMB_SHARE_PATH = "\\YOUR_SERVER\YOUR_SHARE\GrayShare"
-$env:SMB_USERNAME = "YOUR_USERNAME"
-$env:SMB_PASSWORD = "YOUR_PASSWORD"
-```
-
-## Receive Paths
-
-GrayShare currently uses three receive flows:
-
-- desktop loopback
-  Native save dialog via pywebview and `POST /api/receive/{id}/save-local`
-- browsers with File System Access API
-  browser-selected save handle
-- mobile / plain browsers
-  native browser download via `GET /api/receive/{id}/download` with HTTP Range support
-
-## PWA
-
-Browser clients still include a manifest and service worker, but the UI no longer shows an in-app install button.
-
-Important limitation:
-
-- `localhost` is installable in supported browsers
-- plain `http://LAN-IP:port` may not show an install prompt on some browsers because PWA installability depends on secure-context rules
-
-## Development
-
-Create an environment and install dependencies:
-
-```powershell
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
+```bash
+python3 -m venv .venv
+source .venv/bin/activate        # Linux/macOS
+# .\.venv\Scripts\Activate.ps1   # Windows PowerShell
 pip install -r requirements.txt pyinstaller
 ```
 
-Run the desktop app from source:
+Linux GUI mode also needs WebKitGTK, e.g. `sudo apt install python3-gi gir1.2-webkit2-4.1 libgtk-3-0`.
 
-```powershell
-.\.venv\Scripts\python.exe .\desktop_app.py
+```bash
+python desktop_app.py            # Linux/macOS
+# .\.venv\Scripts\python.exe .\desktop_app.py   # Windows
 ```
 
-Run the API only:
+API only: `python -m uvicorn main:app --reload`
 
-```powershell
-.\.venv\Scripts\python.exe -m uvicorn main:app --reload
+Headless (prints LAN URL + access key):
+
+```bash
+python desktop_app.py --server-only --port 4567
 ```
+
+The desktop window talks to loopback (`127.0.0.1`). Phones use the LAN URL shown in the app (QR includes `?k=`). Logs: `startup.log` and `backend.log` under the per-OS data dir (Windows `%USERPROFILE%\.grayshare`, macOS `~/Library/Application Support/GrayShare`, Linux `~/.local/share/grayshare`). Details: [docs/architecture.md](docs/architecture.md).
 
 ## Build
 
-Build both the portable exe and installer:
+Windows portable exe + NSIS: `.\build_portable.ps1 -SkipInstall` (outputs `dist\GrayShare.exe`; full script also builds `GrayShare-Setup.exe`).
 
-```powershell
-.\build_portable.ps1 -SkipInstall
-```
+Linux/macOS: `./build.sh --skip-install` → `dist/grayshare`; add `--server-only` for `dist/grayshare-server`.
 
-Full build:
-
-```powershell
-.\build_portable.ps1
-```
-
-Outputs:
-
-- `dist\GrayShare.exe`
-- `dist\GrayShare-Setup.exe`
-
-If `dist` is locked, the build falls back to `dist_build`.
+Packaging notes and a verify checklist: [docs/skills/package.md](docs/skills/package.md).
 
 ## Troubleshooting
 
-If the desktop app fails to start, check:
-
-- `%USERPROFILE%\.grayshare\startup.log`
-- `%USERPROFILE%\.grayshare\backend.log`
-
-If LAN clients cannot connect, check:
-
-- both devices are on the same network
-- Windows Firewall allows GrayShare on private networks
-- the network is not using client isolation / guest isolation
+If the desktop app fails to start, read `startup.log` and `backend.log` in the data dir above. If LAN clients cannot connect: same network, Windows Firewall allows GrayShare on private networks, and the network is not using client isolation.
